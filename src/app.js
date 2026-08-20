@@ -1055,7 +1055,7 @@ export class DubbingApp {
       } catch (e) {}
 
       // 2. Direct GameBanana API fallback (works natively on GitHub Pages!)
-      if (!data || !data.success) {
+      if (!data || !data.success || !data.scenes || data.scenes.length === 0) {
         const GAME_ID = 20674;
         let apiUrl = '';
         if (searchQuery && searchQuery.trim().length > 0) {
@@ -1064,11 +1064,30 @@ export class DubbingApp {
           apiUrl = `https://gamebanana.com/apiv11/Game/${GAME_ID}/Subfeed?_nPage=${page}&_nPerpage=24`;
         }
 
-        const gbRes = await fetch(apiUrl);
-        if (gbRes.ok) {
-          const rawData = await gbRes.json();
-          const records = rawData?._aRecords || [];
+        let rawData = null;
+        try {
+          const gbRes = await fetch(apiUrl);
+          if (gbRes.ok) {
+            rawData = await gbRes.json();
+          }
+        } catch (err) {
+          console.warn('Direct GameBanana fetch failed, trying CORS proxy:', err);
+        }
 
+        // 3. CORS Proxy Fallback (if browser extensions or adblockers block direct API)
+        if (!rawData || !rawData._aRecords) {
+          try {
+            const proxyRes = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(apiUrl)}`);
+            if (proxyRes.ok) {
+              rawData = await proxyRes.json();
+            }
+          } catch (proxyErr) {
+            console.warn('Proxy fetch failed:', proxyErr);
+          }
+        }
+
+        if (rawData && rawData._aRecords) {
+          const records = rawData._aRecords || [];
           const scenes = records.map(item => {
             let thumb = '';
             const previewImages = item._aPreviewMedia?._aImages || [];
@@ -1100,8 +1119,8 @@ export class DubbingApp {
         }
       }
 
-      if (data && data.success) {
-        this.onlineScenes = data.scenes || [];
+      if (data && data.success && data.scenes) {
+        this.onlineScenes = data.scenes;
         this.onlineTotal = data.total || this.onlineScenes.length;
       } else {
         this.showToast('Error cargando escenas de GameBanana.', 'error');
