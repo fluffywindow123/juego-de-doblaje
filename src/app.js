@@ -1498,9 +1498,18 @@ export class DubbingApp {
                   ` : ''}
 
                   ${item.status === 'error' ? `
-                    <button class="btn-secondary btn-retry-download" data-mod-id="${item.id}" style="padding:0.3rem 0.75rem; font-size:0.8rem;">
-                      🔄 Reintentar
-                    </button>
+                    <div style="display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center;">
+                      <button class="btn-secondary btn-retry-download" data-mod-id="${item.id}" style="padding:0.35rem 0.75rem; font-size:0.8rem;">
+                        🔄 Reintentar
+                      </button>
+                      <a href="${item.downloadUrl || `https://gamebanana.com/mods/${item.id}`}" target="_blank" class="btn-cyan" style="text-decoration:none; padding:0.35rem 0.75rem; font-size:0.8rem; background:linear-gradient(135deg, var(--neon-cyan), #0088ff); color:#000; font-weight:800;" title="Abrir y descargar ZIP directamente de GameBanana">
+                        ⬇️ Descargar Directo (Navegador)
+                      </a>
+                      <label class="btn-secondary" style="cursor:pointer; padding:0.35rem 0.75rem; font-size:0.8rem; margin:0;" title="Seleccionar el archivo ZIP descargado">
+                        📂 Importar ZIP
+                        <input type="file" class="input-import-failed-download" data-mod-id="${item.id}" accept=".zip,.rar,.7z,.tar" style="display:none;" />
+                      </label>
+                    </div>
                   ` : ''}
                 </div>
               </div>
@@ -1668,6 +1677,46 @@ export class DubbingApp {
     this.executeModDownload(nextItem);
   }
 
+  async fetchModItemData(modId) {
+    const endpoints = [
+      `https://api.gamebanana.com/Core/Item/Data?itemtype=Mod&itemid=${modId}&fields=name,Files().aFiles()`,
+      `https://cors.eu.org/https://api.gamebanana.com/Core/Item/Data?itemtype=Mod&itemid=${modId}&fields=name,Files().aFiles()`,
+      `https://proxy.cors.sh/https://api.gamebanana.com/Core/Item/Data?itemtype=Mod&itemid=${modId}&fields=name,Files().aFiles()`
+    ];
+
+    for (const ep of endpoints) {
+      try {
+        const res = await fetch(ep);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data[1]) return data;
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  async fetchGameBananaFile(downloadUrl, queueItem) {
+    const candidates = [
+      `/api/gamebanana/download?modId=${queueItem.id}`,
+      `https://cors.eu.org/${downloadUrl}`,
+      `https://proxy.cors.sh/${downloadUrl}`,
+      downloadUrl
+    ];
+
+    for (const url of candidates) {
+      try {
+        const res = await fetch(url);
+        if (res.ok) {
+          return res;
+        }
+      } catch (e) {
+        console.warn(`Candidate fetch failed for ${url}:`, e);
+      }
+    }
+    return null;
+  }
+
   async executeModDownload(queueItem) {
     const modId = queueItem.id;
     const modTitle = queueItem.title;
@@ -1679,6 +1728,7 @@ export class DubbingApp {
       let effectiveFileName = `${modTitle}.zip`;
       let totalBytes = 0;
 
+      // 1. Try local server endpoint first if running with backend
       try {
         const localRes = await fetch(`/api/gamebanana/download?modId=${modId}`);
         if (localRes.ok) {
@@ -1694,13 +1744,16 @@ export class DubbingApp {
         res = null;
       }
 
-      // Direct fallback to GameBanana CDN for static GitHub Pages hosting
+      // 2. Direct / Proxy fallback for static GitHub Pages hosting
       if (!res) {
-        const itemRes = await fetch(`https://api.gamebanana.com/Core/Item/Data?itemtype=Mod&itemid=${modId}&fields=name,Files().aFiles()`);
-        if (!itemRes.ok) throw new Error('No se pudo consultar el mod en GameBanana');
-        const modData = await itemRes.json();
-        if (modData && modData[0]) effectiveTitle = modData[0];
-        const filesObj = modData ? modData[1] : null;
+        queueItem.stepText = 'Consultando archivos en GameBanana...';
+        this.updateDrawerUI();
+
+        const modData = await this.fetchModItemData(modId);
+        if (!modData) throw new Error('No se pudo consultar el mod en GameBanana.');
+
+        if (modData[0]) effectiveTitle = modData[0];
+        const filesObj = modData[1];
         if (!filesObj) throw new Error('El mod no tiene archivos disponibles.');
         const fileKeys = Object.keys(filesObj);
         if (fileKeys.length === 0) throw new Error('El mod no tiene archivos descargables.');
@@ -1713,39 +1766,51 @@ export class DubbingApp {
         const fileInfo = filesObj[primaryKey];
         effectiveFileName = fileInfo._sFile || `${effectiveTitle}.zip`;
         totalBytes = fileInfo._nFilesize || 0;
+        queueItem.downloadUrl = fileInfo._sDownloadUrl;
 
-        res = await fetch(fileInfo._sDownloadUrl);
-        if (!res.ok) throw new Error(`HTTP ${res.status} al descargar de GameBanana`);
+        queueItem.stepText = 'Descargando paquete de escena...';
+        this.updateDrawerUI();
+
+        res = await this.fetchGameBananaFile(fileInfo._sDownloadUrl, queueItem);
+        if (!res) {
+          throw new Error('No se pudo descargar el archivo debido a bloqueo CORS.');
+        }
       }
 
-      const reader = res.body.getReader();
       const chunks = [];
       let receivedBytes = 0;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      if (res.body && typeof res.body.getReader === 'function') {
+        const reader = res.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        chunks.push(value);
-        receivedBytes += value.length;
+          chunks.push(value);
+          receivedBytes += value.length;
 
-        const percent = totalBytes > 0 
-          ? Math.min(99, Math.round((receivedBytes / totalBytes) * 100))
-          : Math.min(95, Math.round((receivedBytes / (1024 * 1024 * 30)) * 100));
+          const percent = totalBytes > 0 
+            ? Math.min(99, Math.round((receivedBytes / totalBytes) * 100))
+            : Math.min(95, Math.round((receivedBytes / (1024 * 1024 * 30)) * 100));
 
-        const mbReceived = (receivedBytes / (1024 * 1024)).toFixed(1);
-        const mbTotal = totalBytes > 0 ? (totalBytes / (1024 * 1024)).toFixed(1) + ' MB' : '-- MB';
+          const mbReceived = (receivedBytes / (1024 * 1024)).toFixed(1);
+          const mbTotal = totalBytes > 0 ? (totalBytes / (1024 * 1024)).toFixed(1) + ' MB' : '-- MB';
 
-        const elapsedSec = (performance.now() - startTime) / 1000;
-        const speedMb = elapsedSec > 0 ? ((receivedBytes / (1024 * 1024)) / elapsedSec).toFixed(1) : '0.0';
+          const elapsedSec = (performance.now() - startTime) / 1000;
+          const speedMb = elapsedSec > 0 ? ((receivedBytes / (1024 * 1024)) / elapsedSec).toFixed(1) : '0.0';
 
-        queueItem.percent = percent;
-        queueItem.bytesText = `${mbReceived} / ${mbTotal}`;
-        queueItem.speedText = `${speedMb} MB/s`;
-        queueItem.stepText = `Descargando (${percent}%)...`;
-        queueItem.icon = '📥';
+          queueItem.percent = percent;
+          queueItem.bytesText = `${mbReceived} / ${mbTotal}`;
+          queueItem.speedText = `${speedMb} MB/s`;
+          queueItem.stepText = `Descargando (${percent}%)...`;
+          queueItem.icon = '📥';
 
-        this.updateDrawerUI();
+          this.updateDrawerUI();
+        }
+      } else {
+        const arrayBuf = await res.arrayBuffer();
+        chunks.push(new Uint8Array(arrayBuf));
+        receivedBytes = arrayBuf.byteLength;
       }
 
       // Merge chunks into single ArrayBuffer
@@ -2697,7 +2762,7 @@ export class DubbingApp {
     document.querySelectorAll('.btn-retry-download').forEach(btn => {
       btn.onclick = (e) => {
         e.stopPropagation();
-        const modId = btn.dataset.modId;
+        const modId = parseInt(btn.dataset.modId, 10);
         const item = this.downloadQueue.get(modId);
         if (item) {
           item.status = 'queued';
@@ -2705,6 +2770,29 @@ export class DubbingApp {
           item.stepText = 'En cola...';
           this.render();
           this.processNextInQueue();
+        }
+      };
+    });
+
+    document.querySelectorAll('.input-import-failed-download').forEach(input => {
+      input.onchange = async (e) => {
+        if (e.target.files && e.target.files[0]) {
+          const modId = parseInt(input.dataset.modId, 10);
+          const queueItem = this.downloadQueue.get(modId);
+          if (queueItem) {
+            queueItem.status = 'downloading';
+            queueItem.stepText = '📦 Descomprimiendo archivo seleccionado...';
+            queueItem.percent = 70;
+            this.render();
+          }
+          await this.processZipFile(e.target.files[0]);
+          if (queueItem) {
+            queueItem.status = 'completed';
+            queueItem.percent = 100;
+            queueItem.stepText = '✅ Lista para jugar';
+            queueItem.icon = '✅';
+            this.render();
+          }
         }
       };
     });
