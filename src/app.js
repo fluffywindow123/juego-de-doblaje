@@ -1013,11 +1013,64 @@ export class DubbingApp {
     this.render();
 
     try {
-      const searchParam = searchQuery ? `&search=${encodeURIComponent(searchQuery)}` : '';
-      const res = await fetch(`/api/gamebanana/feed?page=${page}${searchParam}`);
-      const data = await res.json();
+      let data = null;
 
-      if (data.success) {
+      // 1. Try local server proxy first
+      try {
+        const searchParam = searchQuery ? `&search=${encodeURIComponent(searchQuery)}` : '';
+        const res = await fetch(`/api/gamebanana/feed?page=${page}${searchParam}`);
+        if (res.ok) {
+          data = await res.json();
+        }
+      } catch (e) {}
+
+      // 2. Direct GameBanana API fallback (works natively on GitHub Pages!)
+      if (!data || !data.success) {
+        const GAME_ID = 21207;
+        let apiUrl = '';
+        if (searchQuery && searchQuery.trim().length > 0) {
+          apiUrl = `https://gamebanana.com/apiv11/Util/Search/Results?_sSearchString=${encodeURIComponent(searchQuery.trim())}&_idGameRow=${GAME_ID}&_nPage=${page}&_nPerpage=24`;
+        } else {
+          apiUrl = `https://gamebanana.com/apiv11/Game/${GAME_ID}/Subfeed?_nPage=${page}&_nPerpage=24`;
+        }
+
+        const gbRes = await fetch(apiUrl);
+        if (gbRes.ok) {
+          const rawData = await gbRes.json();
+          const records = rawData?._aRecords || [];
+
+          const scenes = records.map(item => {
+            let thumb = '';
+            const previewImages = item._aPreviewMedia?._aImages || [];
+            if (previewImages.length > 0) {
+              const firstImg = previewImages[0];
+              thumb = `${firstImg._sBaseUrl}/${firstImg._sFile530 || firstImg._sFile220 || firstImg._sFile}`;
+            }
+
+            return {
+              id: item._idRow,
+              title: item._sName || 'Escena Sin Título',
+              author: item._aSubmitter?._sName || 'Comunidad',
+              authorAvatar: item._aSubmitter?._sAvatarUrl || '',
+              thumbnailUrl: thumb,
+              dateAdded: item._tsDateAdded,
+              likes: item._nLikeCount || 0,
+              views: item._nViewCount || 0,
+              category: item._aRootCategory?._sName || 'Dub Mode',
+              profileUrl: item._sProfileUrl || `https://gamebanana.com/mods/${item._idRow}`
+            };
+          });
+
+          data = {
+            success: true,
+            page,
+            total: rawData?._aMetadata?._nRecordCount || scenes.length,
+            scenes
+          };
+        }
+      }
+
+      if (data && data.success) {
         this.onlineScenes = data.scenes || [];
         this.onlineTotal = data.total || this.onlineScenes.length;
       } else {
@@ -1087,15 +1140,49 @@ export class DubbingApp {
 
     try {
       const startTime = performance.now();
-      const res = await fetch(`/api/gamebanana/download?modId=${modId}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      let res = null;
+      let effectiveTitle = modTitle;
+      let effectiveFileName = `${modTitle}.zip`;
+      let totalBytes = 0;
 
-      const contentLengthHeader = res.headers.get('Content-Length');
-      const fileNameHeader = res.headers.get('X-File-Name');
-      const sceneTitleHeader = res.headers.get('X-Scene-Title');
-      const effectiveTitle = sceneTitleHeader ? decodeURIComponent(sceneTitleHeader) : modTitle;
-      const effectiveFileName = fileNameHeader ? decodeURIComponent(fileNameHeader) : `${modTitle}.zip`;
-      const totalBytes = contentLengthHeader ? parseInt(contentLengthHeader, 10) : 0;
+      try {
+        const localRes = await fetch(`/api/gamebanana/download?modId=${modId}`);
+        if (localRes.ok) {
+          res = localRes;
+          const contentLengthHeader = res.headers.get('Content-Length');
+          const fileNameHeader = res.headers.get('X-File-Name');
+          const sceneTitleHeader = res.headers.get('X-Scene-Title');
+          if (sceneTitleHeader) effectiveTitle = decodeURIComponent(sceneTitleHeader);
+          if (fileNameHeader) effectiveFileName = decodeURIComponent(fileNameHeader);
+          if (contentLengthHeader) totalBytes = parseInt(contentLengthHeader, 10);
+        }
+      } catch (e) {
+        res = null;
+      }
+
+      // Direct fallback to GameBanana CDN for static GitHub Pages hosting
+      if (!res) {
+        const itemRes = await fetch(`https://api.gamebanana.com/Core/Item/Data?itemtype=Mod&itemid=${modId}&fields=name,Files().aFiles()`);
+        if (!itemRes.ok) throw new Error('No se pudo consultar el mod en GameBanana');
+        const modData = await itemRes.json();
+        if (modData && modData[0]) effectiveTitle = modData[0];
+        const filesObj = modData ? modData[1] : null;
+        if (!filesObj) throw new Error('El mod no tiene archivos disponibles.');
+        const fileKeys = Object.keys(filesObj);
+        if (fileKeys.length === 0) throw new Error('El mod no tiene archivos descargables.');
+
+        const primaryKey = fileKeys.find(k => {
+          const fn = (filesObj[k]._sFile || '').toLowerCase();
+          return fn.endsWith('.zip') || fn.endsWith('.rar') || fn.endsWith('.7z') || fn.endsWith('.tar');
+        }) || fileKeys[0];
+
+        const fileInfo = filesObj[primaryKey];
+        effectiveFileName = fileInfo._sFile || `${effectiveTitle}.zip`;
+        totalBytes = fileInfo._nFilesize || 0;
+
+        res = await fetch(fileInfo._sDownloadUrl);
+        if (!res.ok) throw new Error(`HTTP ${res.status} al descargar de GameBanana`);
+      }
 
       const reader = res.body.getReader();
       const chunks = [];
