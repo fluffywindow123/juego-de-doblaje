@@ -49,6 +49,7 @@ export class DubbingApp {
     this.duration = 0;
     this.startWallTime = 0;
     this.animFrameId = null;
+    this.isFinishingPlayback = false;
     this.playedDialogueIds = new Set();
     this.userRecordedTakes = [];
 
@@ -65,6 +66,7 @@ export class DubbingApp {
     this.isTakeRecording = false;
     this.isTakePlayingUser = false;
     this.takeAnimFrameId = null;
+    this.activeTakeMediaEl = null;
     this.liveMicLevelHistory = [];
     // Saved Dubbed Scenes State
     this.savedDubs = [];
@@ -2538,7 +2540,7 @@ export class DubbingApp {
 
   renderTimelineMarkers() {
     if (!this.selectedScene || !this.selectedScene.dialogues) return '';
-    const totalDuration = this.selectedScene.duration || 60;
+    const totalDuration = this.duration || this.selectedScene.duration || 60;
 
     return this.selectedScene.dialogues.map(d => {
       const leftPercent = Math.min(95, Math.max(0, (d.timestamp / totalDuration) * 100));
@@ -3419,7 +3421,7 @@ export class DubbingApp {
       timelineTrack.onclick = (e) => {
         const rect = timelineTrack.getBoundingClientRect();
         const clickRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-        const jumpTime = clickRatio * (this.selectedScene.duration || 60);
+        const jumpTime = clickRatio * (this.duration || this.selectedScene.duration || 60);
         this.jumpToTime(jumpTime);
       };
     }
@@ -3602,7 +3604,6 @@ export class DubbingApp {
   async setupTakeStudio() {
     this.stopAllAudioAndResetSceneState(false);
     await this.audio.init();
-    await this.audio.requestMicrophone();
 
     const dubDialogues = this.getDubDialogues();
     if (dubDialogues.length === 0) return;
@@ -3720,6 +3721,26 @@ export class DubbingApp {
     const canvas = document.getElementById('take-waveform-canvas');
     const existingTake = this.userTakeRecordings.get(activeDiag.id);
     this.drawWaveform(canvas, refPeaks, 0, null, existingTake?.peaks || null);
+  }
+
+  async startTakeVideoSegment(startTime) {
+    const videoEl = document.getElementById('take-video');
+    if (!videoEl) return { videoEl: null, offset: 0 };
+
+    try {
+      videoEl.pause();
+      videoEl.currentTime = Math.max(0, startTime || 0);
+      videoEl.muted = true;
+      await videoEl.play();
+      return {
+        videoEl,
+        offset: Math.max(0, videoEl.currentTime - (startTime || 0))
+      };
+    } catch (e) {
+      console.warn('Take video could not start:', e);
+      this.showToast('No se pudo iniciar el fragmento de video.', 'error');
+      return null;
+    }
   }
 
   generateSyntheticPeaks(numPeaks = 100) {
@@ -3843,26 +3864,28 @@ export class DubbingApp {
     const diagBuf = this.dialogueAudios.get(activeDiag.id);
     const duration = (diagBuf && diagBuf.duration > 0.3) ? diagBuf.duration : (activeDiag.duration || 3.5);
 
-    // Start video
-    const videoEl = document.getElementById('take-video');
-    if (videoEl) {
-      videoEl.currentTime = activeDiag.timestamp || 0;
-      videoEl.muted = true;
-      videoEl.play().catch(() => {});
-    }
+    // Let the native video frame start first, then align every audio source to
+    // that exact frame. This avoids an independent wall clock drifting away.
+    const segment = await this.startTakeVideoSegment(activeDiag.timestamp || 0);
+    if (!segment) return;
+    const { videoEl, offset: videoOffset } = segment;
+    const remainingDuration = Math.max(0.05, duration - videoOffset);
 
     // Play dialogue audio buffer or slice
     let audioPlaying = false;
     const buf = this.dialogueAudios.get(activeDiag.id);
     if (buf) {
-      this.activeTakeAudioSource = this.audio.playBufferSlice(buf, 0, buf.duration, 'original');
+      const audioOffset = Math.min(videoOffset, Math.max(0, buf.duration - 0.01));
+      this.activeTakeAudioSource = this.audio.playBufferSlice(buf, audioOffset, Math.max(0.05, buf.duration - audioOffset), 'original');
       audioPlaying = true;
     } else {
       const diagUrl = this.getDialogueAudioUrl(this.selectedScene, activeDiag);
       if (diagUrl) {
         const audioEl = new Audio(diagUrl);
+        audioEl.currentTime = videoOffset;
         audioEl.volume = this.audio.volumes.original;
         audioEl.play().catch(() => {});
+        this.activeTakeMediaEl = audioEl;
         audioPlaying = true;
       }
     }
@@ -3870,16 +3893,16 @@ export class DubbingApp {
     // If no isolated dialogue audio (dub_only mod), play from backing track!
     if (!audioPlaying) {
       if (this.backingBuffer) {
-        this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, duration, 'backing');
+        this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, (activeDiag.timestamp || 0) + videoOffset, remainingDuration, 'backing');
       } else if (this.backingAudioEl) {
-        this.backingAudioEl.currentTime = activeDiag.timestamp || 0;
+        this.backingAudioEl.currentTime = (activeDiag.timestamp || 0) + videoOffset;
         this.backingAudioEl.volume = this.audio.volumes.backing || 0.8;
         this.backingAudioEl.play().catch(() => {});
       } else {
         const backingUrl = this.getBackingAudioUrl(this.selectedScene);
         if (backingUrl) {
           const audioEl = new Audio(backingUrl);
-          audioEl.currentTime = activeDiag.timestamp || 0;
+          audioEl.currentTime = (activeDiag.timestamp || 0) + videoOffset;
           audioEl.volume = this.audio.volumes.backing || 0.8;
           audioEl.play().catch(() => {});
           this.backingAudioEl = audioEl;
@@ -3887,18 +3910,20 @@ export class DubbingApp {
       }
     }
 
-    // Animate playhead
-    const startTime = performance.now();
+    // Animate the playhead from the video position, not performance.now().
+    const fallbackStartTime = performance.now() - (videoOffset * 1000);
     this.isTakePlayingRef = true;
 
     const animate = () => {
       if (!this.isTakePlayingRef) return;
-      const elapsed = (performance.now() - startTime) / 1000;
+      const elapsed = videoEl
+        ? Math.max(0, videoEl.currentTime - (activeDiag.timestamp || 0))
+        : (performance.now() - fallbackStartTime) / 1000;
       const ratio = Math.min(1.0, elapsed / duration);
 
       this.drawWaveform(canvas, refPeaks, ratio, null, existingTake?.peaks || null);
 
-      if (ratio >= 1.0) {
+      if (ratio >= 1.0 || (videoEl && videoEl.ended)) {
         this.stopTakePlayback();
         setTimeout(() => {
           this.drawWaveform(canvas, refPeaks, 0, null, existingTake?.peaks || null);
@@ -3950,26 +3975,24 @@ export class DubbingApp {
     if (avatarStatus) avatarStatus.textContent = '🎙️ ¡Grabando tu voz!';
     if (avatarOverlay) avatarOverlay.classList.add('speaking');
 
-    // Start video
-    const videoEl = document.getElementById('take-video');
-    if (videoEl) {
-      videoEl.currentTime = activeDiag.timestamp || 0;
-      videoEl.muted = true;
-      videoEl.play().catch(() => {});
-    }
+    const segment = await this.startTakeVideoSegment(activeDiag.timestamp || 0);
+    if (!segment) return;
+    const { videoEl, offset: videoOffset } = segment;
+    const remainingPhraseDuration = Math.max(0.05, phraseDuration - videoOffset);
 
-    // Play backing track slice in background while recording
+    // Keep accompaniment aligned with the same video frame. The video stops at
+    // the end of the reference phrase instead of continuing past its playhead.
     if (this.backingBuffer) {
-      this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, maxRecordDuration, 'backing');
+      this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, (activeDiag.timestamp || 0) + videoOffset, remainingPhraseDuration, 'backing');
     } else if (this.backingAudioEl) {
-      this.backingAudioEl.currentTime = activeDiag.timestamp || 0;
+      this.backingAudioEl.currentTime = (activeDiag.timestamp || 0) + videoOffset;
       this.backingAudioEl.volume = (this.audio.volumes.backing || 0.8) * 0.7;
       this.backingAudioEl.play().catch(() => {});
     } else {
       const backingUrl = this.getBackingAudioUrl(this.selectedScene);
       if (backingUrl) {
         const audioEl = new Audio(backingUrl);
-        audioEl.currentTime = activeDiag.timestamp || 0;
+        audioEl.currentTime = (activeDiag.timestamp || 0) + videoOffset;
         audioEl.volume = (this.audio.volumes.backing || 0.8) * 0.7;
         audioEl.play().catch(() => {});
         this.backingAudioEl = audioEl;
@@ -3984,9 +4007,18 @@ export class DubbingApp {
 
     const animateRec = () => {
       if (!this.isTakeRecording) return;
-      const elapsed = (performance.now() - startTime) / 1000;
-      // Red playhead cursor follows exact 1x speech timing of the phrase
-      const cursorRatio = Math.min(1.0, elapsed / phraseDuration);
+      const recordingElapsed = (performance.now() - startTime) / 1000;
+      const videoElapsed = videoEl
+        ? Math.max(0, videoEl.currentTime - (activeDiag.timestamp || 0))
+        : recordingElapsed + videoOffset;
+      // The playhead follows the native scene frame, so it cannot stop while
+      // the visible scene continues moving.
+      const cursorRatio = Math.min(1.0, videoElapsed / phraseDuration);
+
+      if (videoEl && videoElapsed >= phraseDuration && !videoEl.paused) {
+        videoEl.pause();
+        if (this.backingAudioEl) this.backingAudioEl.pause();
+      }
 
       // Read microphone amplitude
       const dataArray = new Uint8Array(128);
@@ -4000,7 +4032,7 @@ export class DubbingApp {
 
       this.drawWaveform(canvas, refPeaks, cursorRatio, this.liveMicLevelHistory, null);
 
-      if (elapsed >= maxRecordDuration) {
+      if (recordingElapsed >= maxRecordDuration) {
         this.finishTakeRecording(activeDiag);
         return;
       }
@@ -4198,6 +4230,7 @@ export class DubbingApp {
     this.isTakePlayingRef = false;
     this.isTakePlayingUser = false;
     if (this.takeAnimFrameId) cancelAnimationFrame(this.takeAnimFrameId);
+    this.takeAnimFrameId = null;
     if (this.activeTakeAudioSource) {
       try { this.activeTakeAudioSource.stop(); } catch {}
       this.activeTakeAudioSource = null;
@@ -4211,6 +4244,10 @@ export class DubbingApp {
     }
     if (this.backingAudioEl) {
       try { this.backingAudioEl.pause(); } catch {}
+    }
+    if (this.activeTakeMediaEl) {
+      try { this.activeTakeMediaEl.pause(); } catch {}
+      this.activeTakeMediaEl = null;
     }
     const videoEl = document.getElementById('take-video');
     if (videoEl) videoEl.pause();
@@ -4317,13 +4354,11 @@ export class DubbingApp {
       await this.audio.requestMicrophone();
     }
 
-    this.duration = this.selectedScene.duration || 60;
-    const totalEl = document.getElementById('time-total');
-    if (totalEl) {
-      const min = Math.floor(this.duration / 60);
-      const sec = Math.floor(this.duration % 60);
-      totalEl.textContent = `${min}:${sec < 10 ? '0' : ''}${sec}`;
-    }
+    this.currentTime = 0;
+    this.isFinishingPlayback = false;
+    // The package timestamp is a useful fallback while metadata loads. As soon
+    // as it is available, the video's native duration becomes authoritative.
+    this.setStudioDuration(this.selectedScene.duration || 60);
 
     // 1. Prepare HTML5 Audio Elements for instantaneous, reliable playback
     const backingUrl = this.getBackingAudioUrl(this.selectedScene);
@@ -4353,6 +4388,26 @@ export class DubbingApp {
     const videoEl = document.getElementById('studio-video');
     if (videoEl) {
       videoEl.currentTime = 0;
+      videoEl.muted = true;
+
+      videoEl.onloadedmetadata = () => {
+        if (Number.isFinite(videoEl.duration) && videoEl.duration > 0) {
+          this.setStudioDuration(videoEl.duration);
+        }
+      };
+      videoEl.onended = () => {
+        if (this.isPlaying) this.onPlaybackFinished();
+      };
+      videoEl.onpause = () => {
+        // A browser-initiated pause must not leave the visual timeline running.
+        if (this.isPlaying && !videoEl.ended) {
+          this.currentTime = videoEl.currentTime || this.currentTime;
+          this.isPlaying = false;
+          if (this.animFrameId) cancelAnimationFrame(this.animFrameId);
+          this.updateStudioUI(this.currentTime);
+        }
+      };
+
       let curVideoUrl = this.getVideoUrl(this.selectedScene);
 
       // If no MP4 yet and OGV exists, transcode now
@@ -4385,6 +4440,47 @@ export class DubbingApp {
     this.startWaveformVisualizer();
   }
 
+  setStudioDuration(duration) {
+    if (!Number.isFinite(duration) || duration <= 0) return;
+
+    this.duration = duration;
+    const totalEl = document.getElementById('time-total');
+    if (totalEl) {
+      const min = Math.floor(duration / 60);
+      const sec = Math.floor(duration % 60);
+      totalEl.textContent = `${min}:${sec < 10 ? '0' : ''}${sec}`;
+    }
+
+    // Markers are rendered before video metadata is ready, so align them once
+    // the real scene duration is known without rebuilding the whole view.
+    document.querySelectorAll('.timeline-marker[data-jump-time]').forEach(marker => {
+      const timestamp = Number(marker.dataset.jumpTime);
+      if (Number.isFinite(timestamp)) {
+        marker.style.left = `${Math.min(95, Math.max(0, (timestamp / duration) * 100))}%`;
+      }
+    });
+  }
+
+  async startStudioVideoPlayback() {
+    const videoEl = document.getElementById('studio-video');
+    if (!videoEl) return true;
+
+    try {
+      const maxTime = Number.isFinite(videoEl.duration) && videoEl.duration > 0
+        ? Math.max(0, videoEl.duration - 0.01)
+        : Math.max(0, this.currentTime);
+      videoEl.currentTime = Math.min(Math.max(0, this.currentTime), maxTime);
+      videoEl.muted = true;
+      await videoEl.play();
+      this.currentTime = videoEl.currentTime || this.currentTime;
+      return true;
+    } catch (e) {
+      console.warn('Video could not start:', e);
+      this.showToast('No se pudo iniciar el video de esta escena.', 'error');
+      return false;
+    }
+  }
+
   toggleOriginalPlayback() {
     if (this.isPlaying) {
       this.pauseStudioPlayback();
@@ -4396,10 +4492,6 @@ export class DubbingApp {
   async startOriginalScenePlayback() {
     SFX.playClick();
     await this.audio.init();
-
-    this.isPlaying = true;
-    this.isRecording = false;
-    this.startWallTime = performance.now() - (this.currentTime * 1000);
 
     // Populate playedDialogueIds with only past dialogues (prevents audio glitch on resume!)
     this.playedDialogueIds.clear();
@@ -4416,18 +4508,22 @@ export class DubbingApp {
       btnPlay.style.color = '#fff';
     }
 
-    // 1. START MASTER CLOCK LOOP IMMEDIATELY & SYNCHRONOUSLY
-    this.startMasterClockLoop();
-
-    // 2. Play Video (Muted to guarantee 100% immediate playback on 1st click)
-    const videoEl = document.getElementById('studio-video');
-    if (videoEl) {
-      videoEl.currentTime = this.currentTime;
-      videoEl.muted = true;
-      videoEl.play().catch(e => console.warn('Video play warning:', e));
+    // Wait for video playback to begin before advancing the timeline. This
+    // prevents the UI clock from running ahead while the scene is buffering.
+    if (!await this.startStudioVideoPlayback()) {
+      if (btnPlay) {
+        btnPlay.innerHTML = `<span>▶️</span> <span>REPRODUCIR ESCENA</span>`;
+        btnPlay.style.background = 'linear-gradient(135deg, var(--neon-green), #00a653)';
+        btnPlay.style.color = '#000';
+      }
+      return;
     }
 
-    // 3. Play Backing Audio
+    this.isPlaying = true;
+    this.isRecording = false;
+    this.startWallTime = performance.now() - (this.currentTime * 1000);
+
+    // Start the backing track at the exact frame reported by the video.
     if (this.backingAudioEl) {
       this.backingAudioEl.currentTime = this.currentTime;
       this.backingAudioEl.volume = Math.max(0, Math.min(1.0, this.audio.volumes.backing));
@@ -4435,6 +4531,8 @@ export class DubbingApp {
     } else if (this.backingBuffer) {
       this.audio.playBuffer(this.backingBuffer, 'backing', this.currentTime);
     }
+
+    this.startMasterClockLoop();
   }
 
   async toggleRecording() {
@@ -4448,6 +4546,9 @@ export class DubbingApp {
   async startStudioRecording() {
     SFX.playRecStart();
     await this.audio.init();
+    await this.audio.requestMicrophone();
+
+    if (!await this.startStudioVideoPlayback()) return;
 
     this.isRecording = true;
     this.isPlaying = true;
@@ -4465,13 +4566,6 @@ export class DubbingApp {
     const recText = document.getElementById('rec-btn-text');
     if (btnRec) btnRec.classList.add('recording');
     if (recText) recText.textContent = 'GRABANDO... (PULSA PARA PAUSAR)';
-
-    const videoEl = document.getElementById('studio-video');
-    if (videoEl) {
-      videoEl.currentTime = this.currentTime;
-      videoEl.muted = true;
-      videoEl.play().catch(e => console.log('Video play notice:', e));
-    }
 
     let backingPlayed = false;
     if (this.backingAudioEl) {
@@ -4492,6 +4586,7 @@ export class DubbingApp {
   }
 
   async pauseStudioPlayback() {
+    const wasRecording = this.isRecording;
     this.isRecording = false;
     this.isPlaying = false;
 
@@ -4508,7 +4603,10 @@ export class DubbingApp {
     }
 
     const videoEl = document.getElementById('studio-video');
-    if (videoEl) videoEl.pause();
+    if (videoEl) {
+      this.currentTime = videoEl.currentTime || this.currentTime;
+      videoEl.pause();
+    }
 
     if (this.backingAudioEl) this.backingAudioEl.pause();
 
@@ -4520,7 +4618,7 @@ export class DubbingApp {
 
     this.audio.stopAll();
 
-    if (this.isRecording) {
+    if (wasRecording) {
       const take = await this.audio.stopRecording();
       if (take && take.blob) {
         this.userRecordedTakes.push({
@@ -4531,6 +4629,7 @@ export class DubbingApp {
     }
 
     if (this.animFrameId) cancelAnimationFrame(this.animFrameId);
+    this.animFrameId = null;
   }
 
   togglePlaybackPause() {
@@ -4555,23 +4654,28 @@ export class DubbingApp {
   }
 
   jumpToTime(targetSeconds) {
-    this.currentTime = targetSeconds;
-    this.startWallTime = performance.now() - (targetSeconds * 1000);
+    const safeTarget = Math.max(0, Math.min(targetSeconds, this.duration || targetSeconds));
+    this.currentTime = safeTarget;
+    this.startWallTime = performance.now() - (safeTarget * 1000);
     this.playedDialogueIds.clear();
 
     const videoEl = document.getElementById('studio-video');
-    if (videoEl) videoEl.currentTime = targetSeconds;
+    if (videoEl) videoEl.currentTime = safeTarget;
 
-    if (this.backingAudioEl) this.backingAudioEl.currentTime = targetSeconds;
+    if (this.backingAudioEl) this.backingAudioEl.currentTime = safeTarget;
 
     const dialogues = this.selectedScene.dialogues || [];
     for (const d of dialogues) {
-      if (d.timestamp < targetSeconds) {
+      if (d.audioEl) {
+        d.audioEl.pause();
+        d.audioEl.currentTime = 0;
+      }
+      if (d.timestamp < safeTarget) {
         this.playedDialogueIds.add(d.id);
       }
     }
 
-    this.updateStudioUI(targetSeconds);
+    this.updateStudioUI(safeTarget);
   }
 
   startMasterClockLoop() {
@@ -4580,12 +4684,42 @@ export class DubbingApp {
     const loop = () => {
       if (!this.isPlaying) return;
 
-      const elapsedSec = (performance.now() - this.startWallTime) / 1000;
-      this.currentTime = Math.max(0, elapsedSec);
+      const videoEl = document.getElementById('studio-video');
+      if (videoEl) {
+        if (Number.isFinite(videoEl.duration) && videoEl.duration > 0 && videoEl.duration !== this.duration) {
+          this.setStudioDuration(videoEl.duration);
+        }
 
-      if (this.currentTime >= this.duration) {
-        this.onPlaybackFinished();
-        return;
+        if (videoEl.ended) {
+          this.currentTime = videoEl.duration || this.currentTime;
+          this.updateStudioUI(this.currentTime);
+          this.onPlaybackFinished();
+          return;
+        }
+
+        if (videoEl.paused) {
+          this.currentTime = videoEl.currentTime || this.currentTime;
+          this.isPlaying = false;
+          this.updateStudioUI(this.currentTime);
+          return;
+        }
+
+        // The video frame is the source of truth for subtitles, dialogue cues
+        // and progress. Do not derive it from wall-clock time.
+        this.currentTime = Math.max(0, videoEl.currentTime || 0);
+
+        // Keep the package backing track aligned if a browser briefly drifts.
+        if (this.backingAudioEl && !this.backingAudioEl.paused && Math.abs(this.backingAudioEl.currentTime - this.currentTime) > 0.12) {
+          this.backingAudioEl.currentTime = this.currentTime;
+        }
+      } else {
+        // Audio-only packages retain a wall-clock fallback.
+        const elapsedSec = (performance.now() - this.startWallTime) / 1000;
+        this.currentTime = Math.max(0, elapsedSec);
+        if (this.currentTime >= this.duration) {
+          this.onPlaybackFinished();
+          return;
+        }
       }
 
       this.updateStudioUI(this.currentTime);
@@ -4615,16 +4749,23 @@ export class DubbingApp {
     this.animFrameId = requestAnimationFrame(loop);
   }
 
-  onPlaybackFinished() {
-    this.pauseStudioPlayback();
-    if (this.playbackMode === 'dubbing') {
-      this.finishStudioTake();
-    } else {
-      const btnPlay = document.getElementById('btn-play-original-mode');
-      if (btnPlay) {
-        btnPlay.innerHTML = `<span>▶️</span> <span>REPRODUCIR DE NUEVO</span>`;
+  async onPlaybackFinished() {
+    if (this.isFinishingPlayback) return;
+    this.isFinishingPlayback = true;
+
+    try {
+      await this.pauseStudioPlayback();
+      if (this.playbackMode === 'dubbing') {
+        await this.finishStudioTake();
+      } else {
+        const btnPlay = document.getElementById('btn-play-original-mode');
+        if (btnPlay) {
+          btnPlay.innerHTML = `<span>▶️</span> <span>REPRODUCIR DE NUEVO</span>`;
+        }
+        this.showToast('Escena finalizada.', 'info');
       }
-      this.showToast('Escena finalizada.', 'info');
+    } finally {
+      this.isFinishingPlayback = false;
     }
   }
 
