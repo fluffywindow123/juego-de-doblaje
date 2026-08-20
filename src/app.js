@@ -381,11 +381,27 @@ export class DubbingApp {
     const cacheKey = `video_${scene.id}`;
     if (this.blobUrlCache.has(cacheKey)) return this.blobUrlCache.get(cacheKey);
 
-    let videoKey = Object.keys(scene.rawFiles).find(k => k.endsWith('.mp4')) ||
-                   Object.keys(scene.rawFiles).find(k => k.endsWith('.webm'));
+    const keys = Object.keys(scene.rawFiles);
+    // 1. Check explicit scene.videoKey if valid
+    let videoKey = scene.videoKey && scene.rawFiles[scene.videoKey] ? scene.videoKey : null;
+
+    // 2. Search by extension prioritizing universal formats
+    if (!videoKey) {
+      videoKey = keys.find(k => k.toLowerCase().endsWith('.mp4')) ||
+                 keys.find(k => k.toLowerCase().endsWith('.webm')) ||
+                 keys.find(k => k.toLowerCase().endsWith('.ogv') || k.toLowerCase().endsWith('.ogg')) ||
+                 keys.find(k => k.toLowerCase().endsWith('.mov') || k.toLowerCase().endsWith('.m4v') || k.toLowerCase().endsWith('.mkv'));
+    }
 
     if (videoKey && scene.rawFiles[videoKey]) {
-      const mime = videoKey.endsWith('.mp4') ? 'video/mp4' : 'video/webm';
+      const lower = videoKey.toLowerCase();
+      let mime = 'video/mp4';
+      if (lower.endsWith('.webm')) mime = 'video/webm';
+      else if (lower.endsWith('.ogv') || lower.endsWith('.ogg')) mime = 'video/ogg';
+      else if (lower.endsWith('.mov')) mime = 'video/quicktime';
+      else if (lower.endsWith('.m4v')) mime = 'video/mp4';
+      else if (lower.endsWith('.mkv')) mime = 'video/x-matroska';
+
       const blob = this.toBlob(scene.rawFiles[videoKey], mime);
       if (blob) {
         const url = URL.createObjectURL(blob);
@@ -3614,9 +3630,20 @@ export class DubbingApp {
     // 1. Prepare and seek video
     const videoEl = document.getElementById('take-video');
     if (videoEl) {
-      videoEl.currentTime = activeDiag.timestamp || 0;
       videoEl.muted = true;
-      videoEl.pause();
+      if (!videoEl.src || videoEl.src === window.location.href) {
+        const vUrl = this.getVideoUrl(this.selectedScene);
+        if (vUrl) videoEl.src = vUrl;
+      }
+      const seekTime = activeDiag.timestamp || 0;
+      if (videoEl.readyState >= 1) {
+        try { videoEl.currentTime = seekTime; } catch {}
+      } else {
+        videoEl.onloadedmetadata = () => {
+          try { videoEl.currentTime = seekTime; } catch {}
+        };
+      }
+      try { videoEl.pause(); } catch {}
     }
 
     // 2. Prepare backing audio element and buffer if needed
@@ -3728,18 +3755,21 @@ export class DubbingApp {
     if (!videoEl) return { videoEl: null, offset: 0 };
 
     try {
+      videoEl.muted = true;
+      if (!videoEl.src || videoEl.src === window.location.href) {
+        const vUrl = this.getVideoUrl(this.selectedScene);
+        if (vUrl) videoEl.src = vUrl;
+      }
       videoEl.pause();
       videoEl.currentTime = Math.max(0, startTime || 0);
-      videoEl.muted = true;
       await videoEl.play();
       return {
         videoEl,
         offset: Math.max(0, videoEl.currentTime - (startTime || 0))
       };
     } catch (e) {
-      console.warn('Take video could not start:', e);
-      this.showToast('No se pudo iniciar el fragmento de video.', 'error');
-      return null;
+      console.warn('Take video notice:', e);
+      return { videoEl, offset: 0 };
     }
   }
 
@@ -4115,8 +4145,14 @@ export class DubbingApp {
     // Start video
     const videoEl = document.getElementById('take-video');
     if (videoEl) {
-      videoEl.currentTime = activeDiag.timestamp || 0;
       videoEl.muted = true;
+      if (!videoEl.src || videoEl.src === window.location.href) {
+        const vUrl = this.getVideoUrl(this.selectedScene);
+        if (vUrl) videoEl.src = vUrl;
+      }
+      try {
+        videoEl.currentTime = activeDiag.timestamp || 0;
+      } catch {}
       videoEl.play().catch(() => {});
     }
 
@@ -4466,18 +4502,21 @@ export class DubbingApp {
     if (!videoEl) return true;
 
     try {
+      videoEl.muted = true;
+      if (!videoEl.src || videoEl.src === window.location.href) {
+        const vUrl = this.getVideoUrl(this.selectedScene);
+        if (vUrl) videoEl.src = vUrl;
+      }
       const maxTime = Number.isFinite(videoEl.duration) && videoEl.duration > 0
         ? Math.max(0, videoEl.duration - 0.01)
         : Math.max(0, this.currentTime);
       videoEl.currentTime = Math.min(Math.max(0, this.currentTime), maxTime);
-      videoEl.muted = true;
       await videoEl.play();
       this.currentTime = videoEl.currentTime || this.currentTime;
       return true;
     } catch (e) {
-      console.warn('Video could not start:', e);
-      this.showToast('No se pudo iniciar el video de esta escena.', 'error');
-      return false;
+      console.warn('Studio video notice:', e);
+      return true;
     }
   }
 
