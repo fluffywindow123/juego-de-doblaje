@@ -3632,25 +3632,59 @@ export class DubbingApp {
       this.backingBuffer = await this.audio.decodeAudio(this.selectedScene.rawFiles[backingKey], `backing_${this.selectedScene.id}`);
     }
 
-    // 3. Extract reference waveform for active dialogue
+    // 3. Find the raw audio data for this dialogue line
+    //    Try: audioKey -> audio_file -> search rawFiles by dialogue id
+    let rawAudio = null;
+    const rawFiles = this.selectedScene.rawFiles || {};
+    const fileKeys = Object.keys(rawFiles);
+
+    if (activeDiag.audioKey && rawFiles[activeDiag.audioKey]) {
+      rawAudio = rawFiles[activeDiag.audioKey];
+    }
+    if (!rawAudio && activeDiag.audio_file) {
+      // scene_meta.json uses audio_file like "01_buzz.mp3"
+      const afKey = fileKeys.find(k => k === activeDiag.audio_file || k.endsWith('/' + activeDiag.audio_file) || k.endsWith(activeDiag.audio_file));
+      if (afKey) {
+        rawAudio = rawFiles[afKey];
+        activeDiag.audioKey = afKey;
+      }
+    }
+    if (!rawAudio) {
+      // Fallback: search by dialogue id in the filename
+      const matchKey = fileKeys.find(k => {
+        const fname = k.substring(k.lastIndexOf('/') + 1).toLowerCase();
+        return fname.includes(activeDiag.id.toLowerCase()) && (fname.endsWith('.mp3') || fname.endsWith('.ogg') || fname.endsWith('.wav'));
+      });
+      if (matchKey) {
+        rawAudio = rawFiles[matchKey];
+        activeDiag.audioKey = matchKey;
+      }
+    }
+
+    // 4. Decode audio and extract waveform + exact duration
     let refPeaks = this.dialogueWaveforms.get(activeDiag.id);
-    if (!refPeaks) {
-      const rawAudio = activeDiag.audioKey && this.selectedScene.rawFiles ? this.selectedScene.rawFiles[activeDiag.audioKey] : null;
-      if (rawAudio) {
-        try {
-          const buf = await this.audio.decodeAudio(rawAudio, `diag_${activeDiag.id}`);
-          if (buf) {
-            refPeaks = this.audio.extractWaveformPeaks(buf, 100);
-            this.dialogueWaveforms.set(activeDiag.id, refPeaks);
-            this.dialogueAudios.set(activeDiag.id, buf);
-            if (buf.duration > 0.5) {
-              activeDiag.duration = parseFloat(buf.duration.toFixed(3));
-              activeDiag.endTime = activeDiag.timestamp + activeDiag.duration;
-            }
+    if (!refPeaks && rawAudio) {
+      try {
+        const buf = await this.audio.decodeAudio(rawAudio, `diag_${activeDiag.id}`);
+        if (buf) {
+          refPeaks = this.audio.extractWaveformPeaks(buf, 100);
+          this.dialogueWaveforms.set(activeDiag.id, refPeaks);
+          this.dialogueAudios.set(activeDiag.id, buf);
+          // ALWAYS use the real decoded audio duration as authoritative
+          if (buf.duration > 0.3) {
+            activeDiag.duration = parseFloat(buf.duration.toFixed(3));
+            activeDiag.endTime = activeDiag.timestamp + activeDiag.duration;
           }
-        } catch (e) {
-          console.warn('Error decoding dialogue for waveform:', e);
         }
+      } catch (e) {
+        console.warn('Error decoding dialogue for waveform:', e);
+      }
+    } else if (refPeaks) {
+      // Already decoded before — check if we have the buffer and update duration
+      const existingBuf = this.dialogueAudios.get(activeDiag.id);
+      if (existingBuf && existingBuf.duration > 0.3) {
+        activeDiag.duration = parseFloat(existingBuf.duration.toFixed(3));
+        activeDiag.endTime = activeDiag.timestamp + activeDiag.duration;
       }
     }
 
@@ -3682,7 +3716,7 @@ export class DubbingApp {
       this.dialogueWaveforms.set(activeDiag.id, refPeaks);
     }
 
-    // 4. Draw initial waveform
+    // 5. Draw initial waveform
     const canvas = document.getElementById('take-waveform-canvas');
     const existingTake = this.userTakeRecordings.get(activeDiag.id);
     this.drawWaveform(canvas, refPeaks, 0, null, existingTake?.peaks || null);
@@ -3804,7 +3838,10 @@ export class DubbingApp {
     const canvas = document.getElementById('take-waveform-canvas');
     const refPeaks = this.dialogueWaveforms.get(activeDiag.id);
     const existingTake = this.userTakeRecordings.get(activeDiag.id);
-    const duration = activeDiag.duration || 3.5;
+
+    // Use the actual decoded audio buffer duration for precise sync
+    const diagBuf = this.dialogueAudios.get(activeDiag.id);
+    const duration = (diagBuf && diagBuf.duration > 0.3) ? diagBuf.duration : (activeDiag.duration || 3.5);
 
     // Start video
     const videoEl = document.getElementById('take-video');
@@ -3818,7 +3855,7 @@ export class DubbingApp {
     let audioPlaying = false;
     const buf = this.dialogueAudios.get(activeDiag.id);
     if (buf) {
-      this.activeTakeAudioSource = this.audio.playBufferSlice(buf, 0, duration, 'original');
+      this.activeTakeAudioSource = this.audio.playBufferSlice(buf, 0, buf.duration, 'original');
       audioPlaying = true;
     } else {
       const diagUrl = this.getDialogueAudioUrl(this.selectedScene, activeDiag);
@@ -3887,7 +3924,9 @@ export class DubbingApp {
     const recBtnText = document.getElementById('take-rec-btn-text');
     const avatarStatus = document.getElementById('take-avatar-status');
     const avatarOverlay = document.getElementById('take-avatar-overlay');
-    const phraseDuration = activeDiag.duration || 3.5;
+    // Use the actual decoded audio buffer duration for precise timeline sync
+    const diagBuf = this.dialogueAudios.get(activeDiag.id);
+    const phraseDuration = (diagBuf && diagBuf.duration > 0.3) ? diagBuf.duration : (activeDiag.duration || 3.5);
     // Allow generous recording time so the user's speech is never cut off early
     const maxRecordDuration = Math.max(5.5, phraseDuration + 2.5);
     const canvas = document.getElementById('take-waveform-canvas');
