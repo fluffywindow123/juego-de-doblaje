@@ -16,7 +16,7 @@ export class DubbingApp {
     this.currentView = 'home';
     this.scenes = [];
     this.selectedScene = null;
-    this.selectedCharacter = 'Woody';
+    this.selectedCharacter = 'All'; // Default to full scene dubbing (all characters)
     this.selectedEffect = 'clean';
     this.playbackMode = 'original'; // 'original' | 'dubbing'
 
@@ -2082,6 +2082,18 @@ export class DubbingApp {
           </p>
 
           <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem;">
+            <!-- Main Choice: Full Scene Dubbing -->
+            <div class="feature-box role-select-card ${this.selectedCharacter === 'All' ? 'active-role' : ''}" data-char="All" style="position:relative; cursor:pointer; text-align:center; border-color: ${this.selectedCharacter === 'All' ? 'var(--neon-green)' : 'var(--border-glass)'}; background: ${this.selectedCharacter === 'All' ? 'rgba(0, 255, 136, 0.14)' : 'var(--bg-card)'};">
+              <div style="position: absolute; top: 10px; right: 10px; background: linear-gradient(135deg, var(--neon-green), #00bb55); color: #000; font-size: 0.75rem; font-weight: 900; padding: 0.2rem 0.55rem; border-radius: 12px;">
+                ⭐ RECOMENDADO
+              </div>
+              <div style="font-size: 3.2rem; line-height: 84px; margin-bottom: 0.75rem;">🎬</div>
+              <h4 style="font-size: 1.25rem; font-weight: 800;">Toda la Escena</h4>
+              <p style="font-size: 0.85rem; color: var(--neon-green); margin-top: 0.2rem;">
+                Dobla todas las frases de la escena (${this.selectedScene.dialogues?.length || 0} diálogos)
+              </p>
+            </div>
+
             ${characters.map(charName => {
               const charImg = this.getCharacterImageUrl(this.selectedScene, charName);
               const charDialogues = (this.selectedScene.dialogues || []).filter(d => d.character.toLowerCase() === charName.toLowerCase());
@@ -2097,19 +2109,13 @@ export class DubbingApp {
                     </div>
                   ` : ''}
                   <img src="${charImg}" style="width: 84px; height: 84px; border-radius: 50%; object-fit: cover; margin: 0 auto 0.75rem auto; border: 3px solid ${isSelected ? 'var(--neon-cyan)' : (isFullyDubbed ? 'var(--neon-green)' : 'rgba(255,255,255,0.2)')}; box-shadow: ${isSelected ? 'var(--shadow-neon-cyan)' : 'none'};" />
-                  <h4 style="font-size: 1.25rem; font-weight: 800;">${charName}</h4>
+                  <h4 style="font-size: 1.25rem; font-weight: 800;">Solo ${charName}</h4>
                   <p style="font-size: 0.85rem; color: ${isFullyDubbed ? 'var(--neon-green)' : 'var(--neon-yellow)'}; margin-top: 0.2rem;">
                     ${isFullyDubbed ? `✅ ${charLines} de ${charLines} frases listas` : `${charLines} frases a doblar`}
                   </p>
                 </div>
               `;
             }).join('')}
-
-            <div class="feature-box role-select-card ${this.selectedCharacter === 'All' ? 'active-role' : ''}" data-char="All" style="cursor:pointer; text-align:center; border-color: ${this.selectedCharacter === 'All' ? 'var(--neon-pink)' : 'var(--border-glass)'}; background: ${this.selectedCharacter === 'All' ? 'rgba(255, 0, 127, 0.12)' : 'var(--bg-card)'};">
-              <div style="font-size: 3.2rem; line-height: 84px; margin-bottom: 0.75rem;">🎭</div>
-              <h4 style="font-size: 1.25rem; font-weight: 800;">Doblaje Completo</h4>
-              <p style="font-size: 0.85rem; color: var(--neon-pink); margin-top: 0.2rem;">Dobla a todos los personajes</p>
-            </div>
           </div>
         </div>
 
@@ -3147,7 +3153,15 @@ export class DubbingApp {
 
     const btnTakeRec = document.getElementById('btn-take-rec');
     if (btnTakeRec) {
-      btnTakeRec.onclick = () => this.startTakeRecording();
+      btnTakeRec.onclick = () => {
+        if (this.isTakeRecording) {
+          const dubDialogues = this.getDubDialogues();
+          const activeDiag = dubDialogues[this.currentTakeIndex];
+          if (activeDiag) this.finishTakeRecording(activeDiag);
+        } else {
+          this.startTakeRecording();
+        }
+      };
     }
 
     const btnTakeListenUser = document.getElementById('btn-take-listen-user');
@@ -3766,7 +3780,9 @@ export class DubbingApp {
     const recBtnText = document.getElementById('take-rec-btn-text');
     const avatarStatus = document.getElementById('take-avatar-status');
     const avatarOverlay = document.getElementById('take-avatar-overlay');
-    const duration = activeDiag.duration || 3.5;
+    const phraseDuration = activeDiag.duration || 3.5;
+    // Allow generous recording time so the user's speech is never cut off early
+    const maxRecordDuration = Math.max(5.5, phraseDuration + 2.5);
     const canvas = document.getElementById('take-waveform-canvas');
     const refPeaks = this.dialogueWaveforms.get(activeDiag.id);
 
@@ -3784,7 +3800,7 @@ export class DubbingApp {
 
     SFX.playRecStart();
     if (recBtn) recBtn.classList.add('recording');
-    if (recBtnText) recBtnText.textContent = 'GRABANDO...';
+    if (recBtnText) recBtnText.textContent = '⏹️ ¡LISTO / DETENER!';
     if (avatarStatus) avatarStatus.textContent = '🎙️ ¡Grabando tu voz!';
     if (avatarOverlay) avatarOverlay.classList.add('speaking');
 
@@ -3798,7 +3814,7 @@ export class DubbingApp {
 
     // Play backing track slice in background while recording
     if (this.backingBuffer) {
-      this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, duration, 'backing');
+      this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, maxRecordDuration, 'backing');
     } else if (this.backingAudioEl) {
       this.backingAudioEl.currentTime = activeDiag.timestamp || 0;
       this.backingAudioEl.volume = (this.audio.volumes.backing || 0.8) * 0.7;
@@ -3819,12 +3835,12 @@ export class DubbingApp {
     await this.audio.startRecording();
 
     const startTime = performance.now();
-    const totalDuration = duration + 0.4;
 
     const animateRec = () => {
       if (!this.isTakeRecording) return;
       const elapsed = (performance.now() - startTime) / 1000;
-      const ratio = Math.min(1.0, elapsed / totalDuration);
+      // Red playhead cursor follows exact 1x speech timing of the phrase
+      const cursorRatio = Math.min(1.0, elapsed / phraseDuration);
 
       // Read microphone amplitude
       const dataArray = new Uint8Array(128);
@@ -3836,9 +3852,9 @@ export class DubbingApp {
       const liveAmp = Math.min(1.0, (sum / dataArray.length) / 35);
       this.liveMicLevelHistory.push(liveAmp);
 
-      this.drawWaveform(canvas, refPeaks, ratio, this.liveMicLevelHistory, null);
+      this.drawWaveform(canvas, refPeaks, cursorRatio, this.liveMicLevelHistory, null);
 
-      if (ratio >= 1.0) {
+      if (elapsed >= maxRecordDuration) {
         this.finishTakeRecording(activeDiag);
         return;
       }
