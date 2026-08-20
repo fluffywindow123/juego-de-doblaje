@@ -98,7 +98,12 @@ export class DubbingApp {
 
   async loadScenes() {
     this.scenes = await GameDB.getAllScenes();
-    if (this.scenes.length === 0) {
+    
+    // Check if starter scene needs MP4 upgrade from starter package
+    const starterScene = this.scenes.find(s => s.id === 'scene_discusion_de_woody_y_buzz_1787187386' || (s.title && s.title.toLowerCase().includes('woody')));
+    const hasMp4 = starterScene && starterScene.rawFiles && Object.keys(starterScene.rawFiles).some(k => k.toLowerCase().endsWith('.mp4'));
+
+    if (this.scenes.length === 0 || (starterScene && !hasMp4)) {
       try {
         const res = await fetch('./eres_un_juguete_e7314.zip');
         if (res.ok) {
@@ -107,11 +112,12 @@ export class DubbingApp {
           const parsed = ZipEngine.parseScenePackage(unzipped);
           if (parsed && parsed.dialogues && parsed.dialogues.length > 0) {
             await GameDB.saveScene({
+              id: starterScene ? starterScene.id : 'scene_discusion_de_woody_y_buzz_1787187386',
               title: parsed.meta.title || 'Discusión de Woody y Buzz',
               authors: parsed.meta.authors || ['Disney / Pixar'],
               readme: parsed.meta.readme || 'Escena clásica de Toy Story 1',
               characters: parsed.meta.characters || ['Woody', 'Buzz Lightyear'],
-              duration: parsed.meta.estimatedDuration || 14.5,
+              duration: parsed.meta.estimatedDuration || 78,
               dialogues: parsed.dialogues,
               prefix: parsed.prefix,
               videoKey: parsed.videoKey,
@@ -275,20 +281,27 @@ export class DubbingApp {
   toBlob(rawData, mimeType = 'application/octet-stream') {
     if (!rawData) return null;
     if (rawData instanceof Blob) return rawData;
-    if (rawData instanceof Uint8Array) {
+    if (rawData instanceof Uint8Array || rawData instanceof Uint8ClampedArray) {
       return new Blob([rawData], { type: mimeType });
     }
     if (rawData instanceof ArrayBuffer) {
       return new Blob([rawData], { type: mimeType });
     }
-    if (typeof rawData === 'object' && rawData.buffer) {
+    if (typeof rawData === 'object' && rawData.buffer && (rawData.byteLength !== undefined || rawData.length !== undefined)) {
       const u8 = new Uint8Array(rawData.buffer, rawData.byteOffset || 0, rawData.byteLength || rawData.length);
       return new Blob([u8], { type: mimeType });
     }
     if (typeof rawData === 'object') {
-      const values = Object.values(rawData);
-      const u8 = new Uint8Array(values);
-      return new Blob([u8], { type: mimeType });
+      try {
+        const len = rawData.length || Object.keys(rawData).length;
+        const u8 = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+          u8[i] = rawData[i];
+        }
+        return new Blob([u8], { type: mimeType });
+      } catch (e) {
+        return new Blob([rawData], { type: mimeType });
+      }
     }
     return new Blob([rawData], { type: mimeType });
   }
@@ -4038,17 +4051,11 @@ export class DubbingApp {
     const animateRec = () => {
       if (!this.isTakeRecording) return;
       const recordingElapsed = (performance.now() - startTime) / 1000;
-      const videoElapsed = videoEl
+      const videoElapsed = videoEl && !videoEl.paused
         ? Math.max(0, videoEl.currentTime - (activeDiag.timestamp || 0))
         : recordingElapsed + videoOffset;
-      // The playhead follows the native scene frame, so it cannot stop while
-      // the visible scene continues moving.
-      const cursorRatio = Math.min(1.0, videoElapsed / phraseDuration);
 
-      if (videoEl && videoElapsed >= phraseDuration && !videoEl.paused) {
-        videoEl.pause();
-        if (this.backingAudioEl) this.backingAudioEl.pause();
-      }
+      const cursorRatio = Math.min(1.0, videoElapsed / phraseDuration);
 
       // Read microphone amplitude
       const dataArray = new Uint8Array(128);
@@ -4062,7 +4069,8 @@ export class DubbingApp {
 
       this.drawWaveform(canvas, refPeaks, cursorRatio, this.liveMicLevelHistory, null);
 
-      if (recordingElapsed >= maxRecordDuration) {
+      // Auto-finish recording the moment the phrase duration ends
+      if (cursorRatio >= 1.0 || videoElapsed >= phraseDuration || recordingElapsed >= phraseDuration) {
         this.finishTakeRecording(activeDiag);
         return;
       }
