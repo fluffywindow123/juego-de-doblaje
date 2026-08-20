@@ -914,7 +914,7 @@ export class DubbingApp {
 
         <!-- Video Player Stage -->
         <div class="stage-card" style="position: relative; aspect-ratio: 16 / 9; background: #000; overflow: hidden; border-radius: var(--radius-xl); box-shadow: 0 15px 40px rgba(0,0,0,0.8); margin-bottom: 1.5rem;">
-          <video id="play-dub-video" class="video-player" src="${videoUrl}" poster="${coverUrl}" playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
+          <video id="play-dub-video" class="video-player" src="${videoUrl}" playsinline webkit-playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
 
           <!-- Current Speaker Avatar Bubble -->
           <div id="play-dub-avatar-overlay" class="talking-avatar-overlay" style="position: absolute; top: 16px; left: 16px; z-index: 10;">
@@ -2265,7 +2265,7 @@ export class DubbingApp {
 
         <!-- Video Player Stage for this Scene Segment -->
         <div class="stage-card" style="position: relative; aspect-ratio: 16 / 9; background: #000; overflow: hidden; border-radius: var(--radius-xl); box-shadow: 0 15px 40px rgba(0,0,0,0.8);">
-          <video id="take-video" class="video-player" src="${videoUrl}" poster="${coverUrl}" playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
+          <video id="take-video" class="video-player" src="${videoUrl}" playsinline webkit-playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
 
           <!-- Avatar Overlay -->
           <div id="take-avatar-overlay" class="talking-avatar-overlay" style="position: absolute; top: 16px; left: 16px; z-index: 10;">
@@ -2421,7 +2421,7 @@ export class DubbingApp {
           <div class="stage-card" style="position: relative; aspect-ratio: 16 / 9; background: #000; overflow: hidden; border-radius: var(--radius-xl); box-shadow: 0 15px 40px rgba(0,0,0,0.8);">
             
             <!-- Video Player Element with Poster -->
-            <video id="studio-video" class="video-player" src="${videoUrl}" poster="${coverUrl}" playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
+            <video id="studio-video" class="video-player" src="${videoUrl}" playsinline webkit-playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
 
             <!-- Talking Avatar Widget Overlay (Top Left) -->
             <div id="avatar-overlay" class="talking-avatar-overlay" style="position: absolute; top: 16px; left: 16px; z-index: 10;">
@@ -2629,7 +2629,7 @@ export class DubbingApp {
         </div>
 
         <div class="result-video-wrapper" style="aspect-ratio: 16/9; max-height: 420px; background: #000; border-radius: var(--radius-xl); overflow: hidden; margin-bottom: 2rem;">
-          <video id="results-video" src="${videoUrl}" poster="${coverUrl}" controls playsinline style="width: 100%; height: 100%; object-fit: contain;"></video>
+          <video id="results-video" src="${videoUrl}" controls playsinline webkit-playsinline style="width: 100%; height: 100%; object-fit: contain;"></video>
         </div>
 
         <div class="results-actions-row">
@@ -3773,12 +3773,19 @@ export class DubbingApp {
         const vUrl = this.getVideoUrl(this.selectedScene);
         if (vUrl) videoEl.src = vUrl;
       }
-      videoEl.pause();
-      videoEl.currentTime = Math.max(0, startTime || 0);
-      await videoEl.play();
+      const targetTime = Math.max(0, startTime || 0);
+      try {
+        videoEl.currentTime = targetTime;
+      } catch (seekErr) {
+        console.warn('Video seek warning:', seekErr);
+      }
+      const p = videoEl.play();
+      if (p && typeof p.catch === 'function') {
+        p.catch(e => console.warn('Video play warning:', e));
+      }
       return {
         videoEl,
-        offset: Math.max(0, videoEl.currentTime - (startTime || 0))
+        offset: Math.max(0, (videoEl.currentTime || targetTime) - targetTime)
       };
     } catch (e) {
       console.warn('Take video notice:', e);
