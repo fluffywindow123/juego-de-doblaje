@@ -165,6 +165,21 @@ export class GameDB {
   }
 
   /**
+   * Get a single recording by ID
+   */
+  static async getRecording(id) {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('recordings', 'readonly');
+      const store = tx.objectStore('recordings');
+      const req = store.get(id);
+
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  /**
    * Delete a recording
    */
   static async deleteRecording(id) {
