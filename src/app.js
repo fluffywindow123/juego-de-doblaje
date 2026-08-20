@@ -2317,9 +2317,15 @@ export class DubbingApp {
               <span>➡️ Siguiente Frase (${currentTakeNum + 1}/${totalTakes})</span>
             </button>
           ` : `
-            <button id="btn-take-finish" class="btn-take-primary" style="background: linear-gradient(135deg, var(--neon-green), #00a852); color: #000; font-weight: 800;">
-              <span>${allCharsDone ? '🎬 ¡FINALIZAR ESCENA COMPLETA!' : `➡️ Siguiente Personaje (${nextUnfinishedChar})`}</span>
-            </button>
+            ${allCharsDone ? `
+              <button id="btn-take-finish-scene" class="btn-take-primary" style="background: linear-gradient(135deg, var(--neon-green), #00a852); color: #000; font-weight: 800;">
+                <span>🎬 ¡FINALIZAR Y VER RESULTADO!</span>
+              </button>
+            ` : `
+              <button id="btn-take-next-char-btn" data-char="${nextUnfinishedChar}" class="btn-take-primary" style="background: linear-gradient(135deg, var(--neon-cyan), #0088cc); color: #000; font-weight: 800;">
+                <span>👉 Siguiente Personaje: ${nextUnfinishedChar} ➡️</span>
+              </button>
+            `}
           `}
         </div>
 
@@ -3262,6 +3268,26 @@ export class DubbingApp {
       btnTakeFinish.onclick = () => this.assembleAndShowResults();
     }
 
+    const btnTakeFinishScene = document.getElementById('btn-take-finish-scene');
+    if (btnTakeFinishScene) {
+      btnTakeFinishScene.onclick = () => this.assembleAndShowResults();
+    }
+
+    const btnTakeNextCharBtn = document.getElementById('btn-take-next-char-btn');
+    if (btnTakeNextCharBtn) {
+      btnTakeNextCharBtn.onclick = async () => {
+        const nextChar = btnTakeNextCharBtn.dataset.char;
+        if (nextChar) {
+          SFX.playSuccess();
+          this.showToast(`¡Personaje completado! Ahora dobla a ${nextChar}.`, 'success');
+          this.selectedCharacter = nextChar;
+          this.currentTakeIndex = 0;
+          this.render();
+          await this.setupTakeStudio();
+        }
+      };
+    }
+
     const btnTakeSaveDub = document.getElementById('btn-take-save-dub');
     if (btnTakeSaveDub) {
       btnTakeSaveDub.onclick = () => this.saveCurrentDubbingSession();
@@ -3960,10 +3986,21 @@ export class DubbingApp {
     if (avatarStatus) avatarStatus.textContent = '✅ Toma grabada';
     if (avatarOverlay) avatarOverlay.classList.remove('speaking');
 
-    this.stopTakePlayback();
-
+    // IMPORTANT: Stop the MediaRecorder FIRST, before stopping other audio
     const take = await this.audio.stopRecording();
-    if (take && take.blob) {
+
+    // Now stop backing audio and video playback
+    if (this.activeTakeAudioSource) {
+      try { this.activeTakeAudioSource.stop(); } catch {}
+      this.activeTakeAudioSource = null;
+    }
+    if (this.backingAudioEl) {
+      try { this.backingAudioEl.pause(); } catch {}
+    }
+    const videoEl = document.getElementById('take-video');
+    if (videoEl) videoEl.pause();
+
+    if (take && take.blob && take.blob.size > 0) {
       SFX.playSuccess();
       const peaks = new Float32Array(this.liveMicLevelHistory);
       const url = URL.createObjectURL(take.blob);
@@ -3982,6 +4019,8 @@ export class DubbingApp {
       this.showToast(`¡Toma de "${activeDiag.character}" grabada con éxito! (Puntuación: ${score}%)`, 'success');
       this.render();
       this.setupTakeStudio();
+    } else {
+      this.showToast('⚠️ No se capturó audio. Asegúrate de permitir el micrófono.', 'error');
     }
   }
 
@@ -3999,7 +4038,8 @@ export class DubbingApp {
 
     const canvas = document.getElementById('take-waveform-canvas');
     const refPeaks = this.dialogueWaveforms.get(activeDiag.id);
-    const duration = activeDiag.duration || 3.5;
+    const phraseDuration = activeDiag.duration || 3.5;
+    const playDuration = Math.max(phraseDuration, take.duration || 3.5);
 
     // Start video
     const videoEl = document.getElementById('take-video');
@@ -4011,14 +4051,14 @@ export class DubbingApp {
 
     // Play backing track in background
     if (this.backingBuffer) {
-      this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, duration, 'backing');
+      this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, playDuration, 'backing');
     } else if (this.backingAudioEl) {
       this.backingAudioEl.currentTime = activeDiag.timestamp || 0;
-      this.backingAudioEl.volume = this.audio.volumes.backing * 0.7;
+      this.backingAudioEl.volume = (this.audio.volumes.backing || 0.8) * 0.7;
       this.backingAudioEl.play().catch(() => {});
     }
 
-    // Play user take audio through Web Audio FX chain or HTML5
+    // Play user take audio through Web Audio FX chain or direct HTML5 audio
     this.activeUserTakeSource = this.audio.playUserRecordedTake(take.buffer, take.url, this.selectedEffect);
 
     // Animate playhead
@@ -4028,7 +4068,7 @@ export class DubbingApp {
     const animate = () => {
       if (!this.isTakePlayingUser) return;
       const elapsed = (performance.now() - startTime) / 1000;
-      const ratio = Math.min(1.0, elapsed / duration);
+      const ratio = Math.min(1.0, elapsed / playDuration);
 
       this.drawWaveform(canvas, refPeaks, ratio, null, take.peaks);
 
@@ -4117,7 +4157,6 @@ export class DubbingApp {
 
   stopTakePlayback() {
     this.isTakePlayingRef = false;
-    this.isTakeRecording = false;
     this.isTakePlayingUser = false;
     if (this.takeAnimFrameId) cancelAnimationFrame(this.takeAnimFrameId);
     if (this.activeTakeAudioSource) {

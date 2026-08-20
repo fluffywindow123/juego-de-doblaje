@@ -239,12 +239,26 @@ export class AudioEngine {
    */
   async startRecording() {
     await this.requestMicrophone();
-    if (!this.micStream) return;
+    if (!this.micStream) {
+      console.warn('Cannot record: mic stream is not available');
+      return;
+    }
+
+    // Ensure audio tracks are live
+    const tracks = this.micStream.getAudioTracks();
+    if (tracks.length === 0 || tracks[0].readyState === 'ended') {
+      this.micStream = null;
+      await this.requestMicrophone();
+    }
+
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      try { this.mediaRecorder.stop(); } catch {}
+    }
 
     this.recordedChunks = [];
     this.recordingStartTime = performance.now();
 
-    const mimeTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg', 'audio/mp4', ''];
+    const mimeTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg', ''];
     let selectedMime = '';
     for (const mime of mimeTypes) {
       if (mime === '' || (window.MediaRecorder && MediaRecorder.isTypeSupported(mime))) {
@@ -263,10 +277,10 @@ export class AudioEngine {
         }
       };
 
-      this.mediaRecorder.start(50);
+      this.mediaRecorder.start(40);
       this.isRecording = true;
     } catch (err) {
-      console.warn('MediaRecorder error:', err);
+      console.warn('MediaRecorder start error:', err);
     }
   }
 
@@ -275,6 +289,10 @@ export class AudioEngine {
    */
   async stopRecording() {
     if (!this.mediaRecorder || this.mediaRecorder.state === 'inactive') {
+      if (this.recordedChunks && this.recordedChunks.length > 0) {
+        const blob = new Blob(this.recordedChunks, { type: 'audio/webm' });
+        return { blob, audioBuf: null, duration: (performance.now() - this.recordingStartTime) / 1000 };
+      }
       return null;
     }
 
@@ -292,7 +310,11 @@ export class AudioEngine {
         }
         resolve({ blob, audioBuf, duration: (performance.now() - this.recordingStartTime) / 1000 });
       };
-      this.mediaRecorder.stop();
+      try {
+        this.mediaRecorder.stop();
+      } catch (e) {
+        resolve(null);
+      }
     });
   }
 
@@ -302,18 +324,18 @@ export class AudioEngine {
   playUserRecordedTake(audioBuffer, blobUrl = null, effectName = 'clean') {
     if (!this.ctx) this.init();
     if (this.ctx && this.ctx.state === 'suspended') {
-      this.ctx.resume();
+      try { this.ctx.resume(); } catch {}
     }
 
-    // 1. Web Audio playback through effect chain
-    if (audioBuffer && this.ctx) {
+    // 1. Web Audio playback through effect chain if buffer is decoded
+    if (audioBuffer && this.ctx && this.ctx.state !== 'closed') {
       try {
         const source = this.ctx.createBufferSource();
         source.buffer = audioBuffer;
 
         const { input, output } = this.createEffectChain(effectName || this.selectedEffect || 'clean');
         source.connect(input);
-        output.connect(this.voiceGain || this.ctx.destination);
+        output.connect(this.voiceGain || this.masterGain || this.ctx.destination);
 
         source.start(0);
         this.activeAudioSources.push(source);
@@ -323,15 +345,15 @@ export class AudioEngine {
         };
         return source;
       } catch (e) {
-        console.warn('Web Audio take play failed, fallback to HTML5:', e);
+        console.warn('Web Audio take play failed, falling back to HTML5:', e);
       }
     }
 
-    // 2. HTML5 Audio Element fallback
+    // 2. HTML5 Audio Element fallback with direct blob URL
     if (blobUrl) {
       try {
         const audio = new Audio(blobUrl);
-        audio.volume = Math.max(0.2, this.volumes.voice || 1.0);
+        audio.volume = Math.max(0.6, Math.min(1.0, this.volumes.voice || 1.0));
         audio.play().catch(e => console.warn('HTML5 user take play error:', e));
         return audio;
       } catch (e) {
