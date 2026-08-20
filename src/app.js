@@ -2923,8 +2923,17 @@ export class DubbingApp {
         this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, duration, 'backing');
       } else if (this.backingAudioEl) {
         this.backingAudioEl.currentTime = activeDiag.timestamp || 0;
-        this.backingAudioEl.volume = this.audio.volumes.backing;
+        this.backingAudioEl.volume = this.audio.volumes.backing || 0.8;
         this.backingAudioEl.play().catch(() => {});
+      } else {
+        const backingUrl = this.getBackingAudioUrl(this.selectedScene);
+        if (backingUrl) {
+          const audioEl = new Audio(backingUrl);
+          audioEl.currentTime = activeDiag.timestamp || 0;
+          audioEl.volume = this.audio.volumes.backing || 0.8;
+          audioEl.play().catch(() => {});
+          this.backingAudioEl = audioEl;
+        }
       }
     }
 
@@ -3000,8 +3009,17 @@ export class DubbingApp {
       this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, duration, 'backing');
     } else if (this.backingAudioEl) {
       this.backingAudioEl.currentTime = activeDiag.timestamp || 0;
-      this.backingAudioEl.volume = this.audio.volumes.backing * 0.7;
+      this.backingAudioEl.volume = (this.audio.volumes.backing || 0.8) * 0.7;
       this.backingAudioEl.play().catch(() => {});
+    } else {
+      const backingUrl = this.getBackingAudioUrl(this.selectedScene);
+      if (backingUrl) {
+        const audioEl = new Audio(backingUrl);
+        audioEl.currentTime = activeDiag.timestamp || 0;
+        audioEl.volume = (this.audio.volumes.backing || 0.8) * 0.7;
+        audioEl.play().catch(() => {});
+        this.backingAudioEl = audioEl;
+      }
     }
 
     this.liveMicLevelHistory = [];
@@ -3325,12 +3343,19 @@ export class DubbingApp {
 
   async startOriginalScenePlayback() {
     SFX.playClick();
-    this.audio.init();
+    await this.audio.init();
 
     this.isPlaying = true;
     this.isRecording = false;
     this.startWallTime = performance.now() - (this.currentTime * 1000);
+
+    // Populate playedDialogueIds with only past dialogues (prevents audio glitch on resume!)
     this.playedDialogueIds.clear();
+    for (const d of (this.selectedScene?.dialogues || [])) {
+      if (d.timestamp < this.currentTime) {
+        this.playedDialogueIds.add(d.id);
+      }
+    }
 
     const btnPlay = document.getElementById('btn-play-original-mode');
     if (btnPlay) {
@@ -3375,7 +3400,14 @@ export class DubbingApp {
     this.isRecording = true;
     this.isPlaying = true;
     this.startWallTime = performance.now() - (this.currentTime * 1000);
+
+    // Populate playedDialogueIds with only past dialogues (prevents audio glitch on resume!)
     this.playedDialogueIds.clear();
+    for (const d of (this.selectedScene?.dialogues || [])) {
+      if (d.timestamp < this.currentTime) {
+        this.playedDialogueIds.add(d.id);
+      }
+    }
 
     const btnRec = document.getElementById('btn-rec');
     const recText = document.getElementById('rec-btn-text');
