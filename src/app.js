@@ -82,6 +82,36 @@ export class DubbingApp {
 
   async loadScenes() {
     this.scenes = await GameDB.getAllScenes();
+    if (this.scenes.length === 0) {
+      try {
+        const res = await fetch('./eres_un_juguete_e7314.zip');
+        if (res.ok) {
+          const arrayBuf = await res.arrayBuffer();
+          const unzipped = await ZipEngine.unzip(arrayBuf);
+          const parsed = ZipEngine.parseScenePackage(unzipped);
+          if (parsed && parsed.dialogues && parsed.dialogues.length > 0) {
+            await GameDB.saveScene({
+              title: parsed.meta.title || 'Discusión de Woody y Buzz',
+              authors: parsed.meta.authors || ['Disney / Pixar'],
+              readme: parsed.meta.readme || 'Escena clásica de Toy Story 1',
+              characters: parsed.meta.characters || ['Woody', 'Buzz Lightyear'],
+              duration: parsed.meta.estimatedDuration || 14.5,
+              dialogues: parsed.dialogues,
+              prefix: parsed.prefix,
+              videoKey: parsed.videoKey,
+              backingTrackKey: parsed.backingTrackKey,
+              iconName: parsed.meta.iconName,
+              imageFiles: parsed.imageFiles,
+              rawFiles: parsed.rawFiles,
+              importDate: new Date().toISOString()
+            });
+            this.scenes = await GameDB.getAllScenes();
+          }
+        }
+      } catch (e) {
+        console.warn('Could not preload starter scene:', e);
+      }
+    }
     this.upgradeLegacyScenes();
   }
 
@@ -1026,7 +1056,7 @@ export class DubbingApp {
 
       // 2. Direct GameBanana API fallback (works natively on GitHub Pages!)
       if (!data || !data.success) {
-        const GAME_ID = 21207;
+        const GAME_ID = 20674;
         let apiUrl = '';
         if (searchQuery && searchQuery.trim().length > 0) {
           apiUrl = `https://gamebanana.com/apiv11/Util/Search/Results?_sSearchString=${encodeURIComponent(searchQuery.trim())}&_idGameRow=${GAME_ID}&_nPage=${page}&_nPerpage=24`;
