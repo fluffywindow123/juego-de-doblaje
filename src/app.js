@@ -99,11 +99,14 @@ export class DubbingApp {
   async loadScenes() {
     this.scenes = await GameDB.getAllScenes();
     
-    // Check if starter scene needs MP4 upgrade from starter package
-    const starterScene = this.scenes.find(s => s.id === 'scene_discusion_de_woody_y_buzz_1787187386' || (s.title && s.title.toLowerCase().includes('woody')));
-    const hasMp4 = starterScene && starterScene.rawFiles && Object.keys(starterScene.rawFiles).some(k => k.toLowerCase().endsWith('.mp4'));
+    // Check if ANY scene in database is missing MP4
+    const needsUpgrade = this.scenes.length === 0 || this.scenes.some(s => {
+      if (!s.rawFiles) return true;
+      const keys = Object.keys(s.rawFiles);
+      return !keys.some(k => k.toLowerCase().endsWith('.mp4'));
+    });
 
-    if (this.scenes.length === 0 || (starterScene && !hasMp4)) {
+    if (needsUpgrade) {
       try {
         const res = await fetch('./eres_un_juguete_e7314.zip');
         if (res.ok) {
@@ -111,8 +114,9 @@ export class DubbingApp {
           const unzipped = await ZipEngine.unzip(arrayBuf);
           const parsed = ZipEngine.parseScenePackage(unzipped);
           if (parsed && parsed.dialogues && parsed.dialogues.length > 0) {
-            await GameDB.saveScene({
-              id: starterScene ? starterScene.id : 'scene_discusion_de_woody_y_buzz_1787187386',
+            const starterId = 'scene_discusion_de_woody_y_buzz_1787187386';
+            const updatedScene = {
+              id: starterId,
               title: parsed.meta.title || 'Discusión de Woody y Buzz',
               authors: parsed.meta.authors || ['Disney / Pixar'],
               readme: parsed.meta.readme || 'Escena clásica de Toy Story 1',
@@ -126,12 +130,14 @@ export class DubbingApp {
               imageFiles: parsed.imageFiles,
               rawFiles: parsed.rawFiles,
               importDate: new Date().toISOString()
-            });
+            };
+            await GameDB.saveScene(updatedScene);
             this.scenes = await GameDB.getAllScenes();
+            this.selectedScene = updatedScene;
           }
         }
       } catch (e) {
-        console.warn('Could not preload starter scene:', e);
+        console.warn('Could not preload/upgrade starter scene with MP4:', e);
       }
     }
     this.upgradeLegacyScenes();
@@ -914,7 +920,7 @@ export class DubbingApp {
 
         <!-- Video Player Stage -->
         <div class="stage-card" style="position: relative; aspect-ratio: 16 / 9; background: #000; overflow: hidden; border-radius: var(--radius-xl); box-shadow: 0 15px 40px rgba(0,0,0,0.8); margin-bottom: 1.5rem;">
-          <video id="play-dub-video" class="video-player" src="${videoUrl}" playsinline webkit-playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
+          <video id="play-dub-video" class="video-player" src="${videoUrl}" poster="${coverUrl}" playsinline webkit-playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
 
           <!-- Current Speaker Avatar Bubble -->
           <div id="play-dub-avatar-overlay" class="talking-avatar-overlay" style="position: absolute; top: 16px; left: 16px; z-index: 10;">
@@ -2265,7 +2271,7 @@ export class DubbingApp {
 
         <!-- Video Player Stage for this Scene Segment -->
         <div class="stage-card" style="position: relative; aspect-ratio: 16 / 9; background: #000; overflow: hidden; border-radius: var(--radius-xl); box-shadow: 0 15px 40px rgba(0,0,0,0.8);">
-          <video id="take-video" class="video-player" src="${videoUrl}" playsinline webkit-playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
+          <video id="take-video" class="video-player" src="${videoUrl}" poster="${coverUrl}" playsinline webkit-playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
 
           <!-- Avatar Overlay -->
           <div id="take-avatar-overlay" class="talking-avatar-overlay" style="position: absolute; top: 16px; left: 16px; z-index: 10;">
@@ -2421,7 +2427,7 @@ export class DubbingApp {
           <div class="stage-card" style="position: relative; aspect-ratio: 16 / 9; background: #000; overflow: hidden; border-radius: var(--radius-xl); box-shadow: 0 15px 40px rgba(0,0,0,0.8);">
             
             <!-- Video Player Element with Poster -->
-            <video id="studio-video" class="video-player" src="${videoUrl}" playsinline webkit-playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
+            <video id="studio-video" class="video-player" src="${videoUrl}" poster="${coverUrl}" playsinline webkit-playsinline preload="auto" style="width: 100%; height: 100%; object-fit: contain; background: #000; display: block;"></video>
 
             <!-- Talking Avatar Widget Overlay (Top Left) -->
             <div id="avatar-overlay" class="talking-avatar-overlay" style="position: absolute; top: 16px; left: 16px; z-index: 10;">
@@ -2629,7 +2635,7 @@ export class DubbingApp {
         </div>
 
         <div class="result-video-wrapper" style="aspect-ratio: 16/9; max-height: 420px; background: #000; border-radius: var(--radius-xl); overflow: hidden; margin-bottom: 2rem;">
-          <video id="results-video" src="${videoUrl}" controls playsinline webkit-playsinline style="width: 100%; height: 100%; object-fit: contain;"></video>
+          <video id="results-video" src="${videoUrl}" poster="${coverUrl}" controls playsinline webkit-playsinline style="width: 100%; height: 100%; object-fit: contain;"></video>
         </div>
 
         <div class="results-actions-row">
