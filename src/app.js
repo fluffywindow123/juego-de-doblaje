@@ -435,9 +435,89 @@ export class DubbingApp {
   // NAVIGATION & ROUTING
   // ==========================================
 
+  stopAllAudioAndResetSceneState(isNewScene = false) {
+    this.isPlaying = false;
+    this.isRecording = false;
+    this.isTakePlayingRef = false;
+    this.isTakeRecording = false;
+    this.isTakePlayingUser = false;
+
+    if (this.animFrameId) {
+      cancelAnimationFrame(this.animFrameId);
+      this.animFrameId = null;
+    }
+    if (this.takeAnimFrameId) {
+      cancelAnimationFrame(this.takeAnimFrameId);
+      this.takeAnimFrameId = null;
+    }
+
+    // 1. Stop Web Audio Engine
+    this.audio.stopAll();
+
+    if (this.activeTakeAudioSource) {
+      try { this.activeTakeAudioSource.stop(); } catch {}
+      this.activeTakeAudioSource = null;
+    }
+    if (this.activeUserTakeSource) {
+      try {
+        if (typeof this.activeUserTakeSource.stop === 'function') this.activeUserTakeSource.stop();
+        if (typeof this.activeUserTakeSource.pause === 'function') this.activeUserTakeSource.pause();
+      } catch {}
+      this.activeUserTakeSource = null;
+    }
+
+    // 2. Pause and completely reset backing audio elements
+    if (this.backingAudioEl) {
+      try {
+        this.backingAudioEl.pause();
+        this.backingAudioEl.currentTime = 0;
+        this.backingAudioEl.src = '';
+      } catch {}
+      this.backingAudioEl = null;
+    }
+
+    // 3. Pause and clean all dialogue audio elements across all scenes
+    for (const scene of this.scenes) {
+      for (const d of (scene.dialogues || [])) {
+        if (d.audioEl) {
+          try {
+            d.audioEl.pause();
+            d.audioEl.currentTime = 0;
+            d.audioEl.src = '';
+          } catch {}
+          d.audioEl = null;
+        }
+      }
+    }
+
+    // 4. Pause all active video players
+    ['studio-video', 'take-video', 'play-dub-video', 'results-video'].forEach(id => {
+      const v = document.getElementById(id);
+      if (v) {
+        try {
+          v.pause();
+          v.currentTime = 0;
+        } catch {}
+      }
+    });
+
+    this.playedDialogueIds.clear();
+    this.playDubPlayedIds.clear();
+
+    if (isNewScene) {
+      this.backingBuffer = null;
+      this.dialogueAudios.clear();
+      this.dialogueWaveforms.clear();
+      this.userTakeRecordings.clear();
+      this.userRecordedTakes = [];
+      this.currentTakeIndex = 0;
+    }
+  }
+
   navigate(viewName, params = {}) {
     SFX.playClick();
-    this.stopStudioPlayback();
+    const isNewScene = params.scene && (!this.selectedScene || params.scene.id !== this.selectedScene.id);
+    this.stopAllAudioAndResetSceneState(isNewScene);
 
     this.currentView = viewName;
     if (params.scene) this.selectedScene = params.scene;
@@ -879,9 +959,10 @@ export class DubbingApp {
       this.backingAudioEl.preload = 'auto';
     }
 
-    // 3. Prepare other dialogue original audios
+    // 3. Prepare other dialogue original audios (only for dialogues that were NOT dubbed by the user)
     for (const d of (sceneSnapshot.dialogues || [])) {
-      if (d.character.toLowerCase() !== (dubRecord.characterDubbed || '').toLowerCase() && dubRecord.characterDubbed !== 'All') {
+      const isUserDub = this.playDubUserBuffers.has(d.id) || (dubRecord.takes || []).some(t => t.dialogueId === d.id);
+      if (!isUserDub) {
         const diagUrl = this.getDialogueAudioUrl(sceneSnapshot, d);
         if (diagUrl) {
           d.audioEl = new Audio(diagUrl);
@@ -951,8 +1032,7 @@ export class DubbingApp {
         if (this.currentTime >= d.timestamp && !this.playDubPlayedIds.has(d.id)) {
           this.playDubPlayedIds.add(d.id);
 
-          const isUserDubbed = this.activePlayingDub?.characterDubbed === 'All' ||
-            d.character.toLowerCase() === (this.activePlayingDub?.characterDubbed || '').toLowerCase();
+          const isUserDubbed = this.playDubUserBuffers.has(d.id) || (this.activePlayingDub?.takes || []).some(t => t.dialogueId === d.id);
 
           if (isUserDubbed) {
             // Play USER'S RECORDED TAKE!
@@ -1058,8 +1138,7 @@ export class DubbingApp {
       if (avatarImg) avatarImg.src = this.getCharacterImageUrl(sceneSnapshot, active.character);
 
       const avatarBadge = document.getElementById('play-dub-avatar-badge');
-      const isUserDubbed = this.activePlayingDub?.characterDubbed === 'All' ||
-        active.character.toLowerCase() === (this.activePlayingDub?.characterDubbed || '').toLowerCase();
+      const isUserDubbed = this.playDubUserBuffers.has(active.id) || (this.activePlayingDub?.takes || []).some(t => t.dialogueId === active.id);
 
       if (avatarBadge) {
         if (isUserDubbed) {
@@ -1076,10 +1155,11 @@ export class DubbingApp {
   async saveCurrentDubbingSession() {
     if (!this.selectedScene) return;
 
-    const dubDialogues = this.getDubDialogues();
+    // Collect ALL recorded takes for this scene (whether from current character or previous characters)
+    const allDialogues = this.selectedScene.dialogues || [];
     const takesArray = [];
 
-    for (const d of dubDialogues) {
+    for (const d of allDialogues) {
       const takeData = this.userTakeRecordings.get(d.id);
       if (takeData) {
         takesArray.push({
@@ -1100,14 +1180,26 @@ export class DubbingApp {
       return;
     }
 
+    const dubbedCharacters = Array.from(new Set(takesArray.map(t => t.character)));
+    let charSummary = dubbedCharacters[0] || 'Personaje';
+    if (dubbedCharacters.length > 1) {
+      charSummary = dubbedCharacters.length === (this.selectedScene.characters || []).length
+        ? 'Toda la Escena (Completo)'
+        : dubbedCharacters.join(' & ');
+    }
+
     const avgScore = Math.round(takesArray.reduce((acc, t) => acc + (t.score || 85), 0) / takesArray.length);
     const rank = avgScore >= 92 ? 'S' : (avgScore >= 82 ? 'A' : (avgScore >= 70 ? 'B' : 'C'));
 
+    // Check if a saved dub record already exists for this scene to update or merge it
+    const existingIndex = this.savedDubs.findIndex(d => d.sceneId === this.selectedScene.id);
+    const dubId = existingIndex >= 0 ? this.savedDubs[existingIndex].id : ('dub_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6));
+
     const dubRecord = {
-      id: 'dub_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+      id: dubId,
       sceneId: this.selectedScene.id,
       sceneTitle: this.selectedScene.title,
-      characterDubbed: this.selectedCharacter,
+      characterDubbed: charSummary,
       effectApplied: this.selectedEffect,
       date: new Date().toISOString(),
       score: avgScore * 100,
@@ -1132,7 +1224,7 @@ export class DubbingApp {
     await this.loadSavedDubs();
 
     SFX.playSuccess();
-    this.showToast(`¡Doblaje de ${this.selectedCharacter} guardado en Mis Doblajes! 🎙️💾`, 'success');
+    this.showToast(`¡Doblaje de "${this.selectedScene.title}" (${charSummary}) guardado! 🎙️💾`, 'success');
     this.navigate('saved_dubs');
   }
 
@@ -3387,6 +3479,7 @@ export class DubbingApp {
   // ==========================================
 
   async setupTakeStudio() {
+    this.stopAllAudioAndResetSceneState(false);
     await this.audio.init();
     await this.audio.requestMicrophone();
 
@@ -3406,9 +3499,11 @@ export class DubbingApp {
 
     // 2. Prepare backing audio element and buffer if needed
     const backingUrl = this.getBackingAudioUrl(this.selectedScene);
-    if (backingUrl && !this.backingAudioEl) {
+    if (backingUrl) {
       this.backingAudioEl = new Audio(backingUrl);
       this.backingAudioEl.preload = 'auto';
+    } else {
+      this.backingAudioEl = null;
     }
 
     const backingKey = this.selectedScene.backingTrackKey || Object.keys(this.selectedScene.rawFiles || {}).find(k => k.includes('backing_track') || k.includes('background') || k.includes('music') || k.includes('_backing_track'));
@@ -3955,10 +4050,10 @@ export class DubbingApp {
   async playCurrentDubFromResults() {
     if (!this.selectedScene) return;
 
-    const dubDialogues = this.getDubDialogues();
+    const allDialogues = this.selectedScene.dialogues || [];
     const takesArray = [];
 
-    for (const d of dubDialogues) {
+    for (const d of allDialogues) {
       const takeData = this.userTakeRecordings.get(d.id);
       if (takeData) {
         takesArray.push({
@@ -3974,11 +4069,19 @@ export class DubbingApp {
       }
     }
 
+    const dubbedCharacters = Array.from(new Set(takesArray.map(t => t.character)));
+    let charSummary = dubbedCharacters[0] || 'Personaje';
+    if (dubbedCharacters.length > 1) {
+      charSummary = dubbedCharacters.length === (this.selectedScene.characters || []).length
+        ? 'Toda la Escena (Completo)'
+        : dubbedCharacters.join(' & ');
+    }
+
     const tempDub = {
       id: 'temp_dub_' + Date.now(),
       sceneId: this.selectedScene.id,
       sceneTitle: this.selectedScene.title,
-      characterDubbed: this.selectedCharacter,
+      characterDubbed: charSummary,
       effectApplied: this.selectedEffect,
       date: new Date().toISOString(),
       score: this.lastResult?.score || 9500,
@@ -4009,6 +4112,7 @@ export class DubbingApp {
   // ==========================================
 
   async setupStudio(autoPlay = false) {
+    this.stopAllAudioAndResetSceneState(false);
     await this.audio.init();
     if (this.playbackMode === 'dubbing') {
       await this.audio.requestMicrophone();
