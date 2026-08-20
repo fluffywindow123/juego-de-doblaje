@@ -1,0 +1,21 @@
+{
+  "name": "juego-de-doblaje",
+  "version": "1.0.0",
+  "description": "Videojuego comercial interactivo de doblaje con soporte para importar escenas en ZIP",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test-suite.js"
+  },
+  "keywords": [
+    "doblaje",
+    "dubbing",
+    "game",
+    "tiktok",
+    "voice",
+    "toy-story"
+  ],
+  "author": "",
+  "license": "MIT"
+}

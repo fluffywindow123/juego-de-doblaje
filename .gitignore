@@ -1,0 +1,8 @@
+node_modules/
+venv/
+.env
+temp_*
+*.ogv
+*.tmp
+.DS_Store
+saved_scenes/
