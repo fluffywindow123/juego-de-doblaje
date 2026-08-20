@@ -2050,7 +2050,16 @@ export class DubbingApp {
     if (!this.selectedScene) return this.renderLibraryView();
 
     const characters = this.selectedScene.characters || ['Woody', 'Buzz'];
+    if (!this.selectedCharacter || this.selectedCharacter === 'All' || !characters.includes(this.selectedCharacter)) {
+      this.selectedCharacter = characters[0];
+    }
     const coverUrl = this.getSceneCoverUrl(this.selectedScene);
+
+    const completedCharsCount = characters.filter(charName => {
+      const charLines = (this.selectedScene.dialogues || []).filter(d => d.character.toLowerCase() === charName.toLowerCase());
+      return charLines.length > 0 && charLines.every(d => this.userTakeRecordings.has(d.id));
+    }).length;
+    const allCharactersDubbed = characters.length > 0 && completedCharsCount === characters.length;
 
     return `
       <div style="max-width: 860px; margin: 0 auto;">
@@ -2059,7 +2068,7 @@ export class DubbingApp {
             ⬅️ Volver a Mis Escenas
           </button>
           <button class="btn-cyan" id="btn-char-listen-now" style="background: linear-gradient(135deg, var(--neon-green), #00a653); color: #000; font-weight: 800;">
-            ▶️ Escuchar Escena Original Primero
+            ▶️ Escuchar Escena Original
           </button>
         </div>
 
@@ -2068,38 +2077,48 @@ export class DubbingApp {
           <div>
             <h2 style="font-size: 1.8rem; font-weight: 800; margin-bottom: 0.5rem;">${this.selectedScene.title}</h2>
             <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 0.75rem;">${this.selectedScene.readme || 'Prepárate para doblar esta escena.'}</p>
-            <div style="display: flex; gap: 0.5rem;">
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
               <span class="char-badge">⏱️ Duración: ${this.selectedScene.duration || 60}s</span>
-              <span class="char-badge">💬 ${this.selectedScene.dialogues?.length || 0} Diálogos</span>
+              <span class="char-badge">💬 ${this.selectedScene.dialogues?.length || 0} Diálogos Totales</span>
+              <span class="char-badge" style="color: ${allCharactersDubbed ? 'var(--neon-green)' : 'var(--neon-cyan)'}; border-color: ${allCharactersDubbed ? 'var(--neon-green)' : 'var(--border-glass)'};">
+                ${allCharactersDubbed ? '✅ ¡Escena 100% Doblada!' : `🎙️ Progreso: ${completedCharsCount}/${characters.length} personajes`}
+              </span>
             </div>
           </div>
         </div>
 
+        ${allCharactersDubbed ? `
+          <div style="background: rgba(0, 255, 136, 0.12); border: 2px solid var(--neon-green); border-radius: var(--radius-lg); padding: 1.5rem; margin-bottom: 2rem; text-align: center; box-shadow: 0 0 30px rgba(0,255,136,0.35);">
+            <div style="font-size: 2.4rem; margin-bottom: 0.4rem;">🎉</div>
+            <h3 style="color: var(--neon-green); font-size: 1.5rem; font-weight: 900; margin-bottom: 0.4rem;">¡Has Doblado a Todos los Personajes de la Escena!</h3>
+            <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 1.25rem;">
+              Todas las frases (${this.selectedScene.dialogues?.length || 0}) están grabadas con tu voz. Guarda la escena completa o reprodúcela de corrido.
+            </p>
+            <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
+              <button class="btn-cyan" id="btn-char-save-full" style="background: linear-gradient(135deg, var(--neon-green), #00bb55); color: #000; font-weight: 900; padding: 0.9rem 2rem; font-size: 1.1rem; box-shadow: 0 0 25px rgba(0,255,136,0.6);">
+                💾 GUARDAR ESCENA COMPLETA EN MIS DOBLAJES
+              </button>
+              <button class="btn-primary" id="btn-char-play-full" style="padding: 0.9rem 1.8rem; font-size: 1.05rem;">
+                ▶️ REPRODUCIR ESCENA COMPLETA DE CORRIDO
+              </button>
+            </div>
+          </div>
+        ` : ''}
+
         <div class="control-card" style="margin-bottom: 2rem;">
-          <h3 class="control-card-title">🎭 Selecciona tu Personaje a Doblar</h3>
+          <h3 class="control-card-title">🎭 Selecciona el Personaje a Doblar</h3>
           <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1.25rem;">
-            Elige el personaje al que le prestarás tu voz. Los diálogos de los demás personajes sonarán con su voz original sincronizada.
+            Dobla las frases de cada personaje una por una. Al terminar todos los personajes, se guardará la escena completa de corrido con todas tus voces.
           </p>
 
           <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem;">
-            <!-- Main Choice: Full Scene Dubbing -->
-            <div class="feature-box role-select-card ${this.selectedCharacter === 'All' ? 'active-role' : ''}" data-char="All" style="position:relative; cursor:pointer; text-align:center; border-color: ${this.selectedCharacter === 'All' ? 'var(--neon-green)' : 'var(--border-glass)'}; background: ${this.selectedCharacter === 'All' ? 'rgba(0, 255, 136, 0.14)' : 'var(--bg-card)'};">
-              <div style="position: absolute; top: 10px; right: 10px; background: linear-gradient(135deg, var(--neon-green), #00bb55); color: #000; font-size: 0.75rem; font-weight: 900; padding: 0.2rem 0.55rem; border-radius: 12px;">
-                ⭐ RECOMENDADO
-              </div>
-              <div style="font-size: 3.2rem; line-height: 84px; margin-bottom: 0.75rem;">🎬</div>
-              <h4 style="font-size: 1.25rem; font-weight: 800;">Toda la Escena</h4>
-              <p style="font-size: 0.85rem; color: var(--neon-green); margin-top: 0.2rem;">
-                Dobla todas las frases de la escena (${this.selectedScene.dialogues?.length || 0} diálogos)
-              </p>
-            </div>
-
             ${characters.map(charName => {
               const charImg = this.getCharacterImageUrl(this.selectedScene, charName);
               const charDialogues = (this.selectedScene.dialogues || []).filter(d => d.character.toLowerCase() === charName.toLowerCase());
               const charLines = charDialogues.length;
+              const charRecordedCount = charDialogues.filter(d => this.userTakeRecordings.has(d.id)).length;
               const isSelected = this.selectedCharacter.toLowerCase() === charName.toLowerCase();
-              const isFullyDubbed = charLines > 0 && charDialogues.every(d => this.userTakeRecordings.has(d.id));
+              const isFullyDubbed = charLines > 0 && charRecordedCount === charLines;
 
               return `
                 <div class="feature-box role-select-card ${isSelected ? 'active-role' : ''}" data-char="${charName}" style="position:relative; cursor:pointer; text-align:center; border-color: ${isSelected ? 'var(--neon-cyan)' : (isFullyDubbed ? 'var(--neon-green)' : 'var(--border-glass)')}; background: ${isSelected ? 'rgba(0, 240, 255, 0.12)' : (isFullyDubbed ? 'rgba(0, 255, 136, 0.08)' : 'var(--bg-card)')};">
@@ -2109,9 +2128,9 @@ export class DubbingApp {
                     </div>
                   ` : ''}
                   <img src="${charImg}" style="width: 84px; height: 84px; border-radius: 50%; object-fit: cover; margin: 0 auto 0.75rem auto; border: 3px solid ${isSelected ? 'var(--neon-cyan)' : (isFullyDubbed ? 'var(--neon-green)' : 'rgba(255,255,255,0.2)')}; box-shadow: ${isSelected ? 'var(--shadow-neon-cyan)' : 'none'};" />
-                  <h4 style="font-size: 1.25rem; font-weight: 800;">Solo ${charName}</h4>
-                  <p style="font-size: 0.85rem; color: ${isFullyDubbed ? 'var(--neon-green)' : 'var(--neon-yellow)'}; margin-top: 0.2rem;">
-                    ${isFullyDubbed ? `✅ ${charLines} de ${charLines} frases listas` : `${charLines} frases a doblar`}
+                  <h4 style="font-size: 1.25rem; font-weight: 800;">${charName}</h4>
+                  <p style="font-size: 0.85rem; color: ${isFullyDubbed ? 'var(--neon-green)' : (charRecordedCount > 0 ? 'var(--neon-yellow)' : 'var(--text-muted)')}; margin-top: 0.2rem;">
+                    ${isFullyDubbed ? `✅ ${charLines} de ${charLines} frases listas` : `${charRecordedCount} de ${charLines} frases grabadas`}
                   </p>
                 </div>
               `;
@@ -2132,7 +2151,7 @@ export class DubbingApp {
         </div>
 
         <button class="btn-primary" id="btn-enter-studio" style="width: 100%; padding: 1.1rem; font-size: 1.2rem; justify-content: center;">
-          🎙️ ¡ENTRAR AL ESTUDIO Y COMENZAR DOBLAJE!
+          🎙️ ¡ENTRAR AL ESTUDIO Y DOBLAR A ${this.selectedCharacter.toUpperCase()}!
         </button>
       </div>
     `;
@@ -2157,7 +2176,6 @@ export class DubbingApp {
         <div class="empty-state">
           <div class="empty-icon">🎭</div>
           <h3>No hay frases registradas para este personaje</h3>
-          <p>Selecciona otro personaje o elige "Doblaje Completo".</p>
           <button class="btn-primary" id="btn-take-back-char" style="margin: 1rem auto;">⬅️ Volver a Personajes</button>
         </div>
       `;
@@ -2178,14 +2196,25 @@ export class DubbingApp {
     const charImg = this.getCharacterImageUrl(this.selectedScene, activeDiag.character);
     const isRecorded = this.userTakeRecordings.has(activeDiag.id);
     const isLastTake = currentTakeNum === totalTakes;
-    const recordedCount = Array.from(this.userTakeRecordings.keys()).filter(id => dubDialogues.some(d => d.id === id)).length;
+    const recordedCount = dubDialogues.filter(d => this.userTakeRecordings.has(d.id)).length;
+    const isCharDone = recordedCount >= totalTakes;
+
+    const characters = this.selectedScene.characters || [];
+    const allCharsDone = characters.length > 0 && characters.every(c => {
+      const lines = (this.selectedScene.dialogues || []).filter(d => d.character.toLowerCase() === c.toLowerCase());
+      return lines.length > 0 && lines.every(d => this.userTakeRecordings.has(d.id));
+    });
+    const nextUnfinishedChar = characters.find(c => {
+      const lines = (this.selectedScene.dialogues || []).filter(d => d.character.toLowerCase() === c.toLowerCase());
+      return lines.length > 0 && !lines.every(d => this.userTakeRecordings.has(d.id));
+    });
 
     return `
       <div class="take-studio-container">
         <!-- Top Navigation Header -->
         <div class="take-header-card">
           <button class="btn-secondary" id="btn-take-back-char">
-            ⬅️ Cambiar Rol / Menú
+            ⬅️ Menú de Personajes
           </button>
 
           <div class="take-step-indicator">
@@ -2197,8 +2226,8 @@ export class DubbingApp {
 
           <div style="display: flex; gap: 0.5rem; align-items: center;">
             <span class="char-badge" style="font-size: 0.85rem;">🎬 ${this.selectedScene.title}</span>
-            <button class="btn-secondary" id="btn-switch-to-full-scene" title="Ver la escena completa" style="padding: 0.4rem 0.8rem; font-size: 0.85rem;">
-              👁️ Escena Completa
+            <button class="btn-secondary" id="btn-switch-to-full-scene" title="Ver la escena original" style="padding: 0.4rem 0.8rem; font-size: 0.85rem;">
+              👁️ Escena Original
             </button>
           </div>
         </div>
@@ -2220,29 +2249,47 @@ export class DubbingApp {
           <div id="take-countdown-overlay" class="countdown-banner" style="display: none;">3</div>
         </div>
 
-        <!-- Dialogue Quote (Identical to reference screenshot) -->
+        <!-- Dialogue Quote -->
         <div class="take-quote-title">
           "${activeDiag.caption}"
         </div>
 
-        <!-- Waveform Card (with cyan border, reference waves, red cursor, and user voice overlay) -->
+        <!-- Waveform Card -->
         <div class="take-waveform-box">
           <canvas id="take-waveform-canvas" class="take-waveform-canvas" width="800" height="140"></canvas>
         </div>
 
-        ${recordedCount >= totalTakes ? `
-          <!-- Character Completed Banner & Save Action -->
-          <div style="background: rgba(0, 255, 136, 0.12); border: 2px solid var(--neon-green); border-radius: var(--radius-md); padding: 0.85rem 1.25rem; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem; box-shadow: 0 0 20px rgba(0,255,136,0.25);">
+        ${isCharDone ? `
+          <!-- Character Completed Banner -->
+          <div style="background: rgba(0, 255, 136, 0.12); border: 2px solid var(--neon-green); border-radius: var(--radius-md); padding: 1rem 1.25rem; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem; box-shadow: 0 0 20px rgba(0,255,136,0.25);">
             <div style="display:flex; align-items:center; gap:0.6rem;">
               <span style="font-size:1.6rem;">✅</span>
               <div>
-                <strong style="color:var(--neon-green); font-size:1.05rem;">¡Personaje ${activeDiag.character} Doblado al 100%!</strong>
-                <div style="font-size:0.8rem; color:var(--text-muted);">Completaste las ${totalTakes} frases. Guarda tu actuación para reproducirla con tu voz cuando quieras.</div>
+                <strong style="color:var(--neon-green); font-size:1.05rem;">
+                  ${allCharsDone ? '🎉 ¡TODOS LOS PERSONAJES DE LA ESCENA ESTÁN DOBLADOS!' : `¡Personaje ${activeDiag.character} Doblado al 100%!`}
+                </strong>
+                <div style="font-size:0.8rem; color:var(--text-muted);">
+                  ${allCharsDone ? 'La escena completa está lista para guardarse y reproducirse de corrido.' : `Ahora dobla a ${nextUnfinishedChar} para completar toda la escena.`}
+                </div>
               </div>
             </div>
-            <button id="btn-take-save-dub" class="btn-cyan" style="background: linear-gradient(135deg, var(--neon-green), #00bb55); color: #000; font-weight:900; padding: 0.7rem 1.5rem; font-size: 1rem; box-shadow: 0 0 20px rgba(0,255,136,0.6);">
-              💾 GUARDAR DOBLAJE
-            </button>
+            <div style="display:flex; gap:0.6rem; flex-wrap: wrap;">
+              ${allCharsDone ? `
+                <button id="btn-take-save-dub" class="btn-cyan" style="background: linear-gradient(135deg, var(--neon-green), #00bb55); color: #000; font-weight:900; padding: 0.7rem 1.5rem; font-size: 1rem; box-shadow: 0 0 20px rgba(0,255,136,0.6);">
+                  💾 GUARDAR ESCENA COMPLETA
+                </button>
+                <button id="btn-take-play-full" class="btn-primary" style="padding: 0.7rem 1.3rem; font-size: 0.95rem;">
+                  ▶️ REPRODUCIR ESCENA
+                </button>
+              ` : `
+                <button id="btn-take-next-char" data-char="${nextUnfinishedChar}" class="btn-cyan" style="background: linear-gradient(135deg, var(--neon-cyan), #0088cc); color: #000; font-weight:900; padding: 0.7rem 1.4rem; font-size: 0.95rem;">
+                  🎙️ Doblar a ${nextUnfinishedChar} ➡️
+                </button>
+                <button id="btn-take-to-chars" class="btn-secondary" style="padding: 0.7rem 1.2rem; font-size: 0.95rem;">
+                  🎭 Menú Personajes
+                </button>
+              `}
+            </div>
           </div>
         ` : ''}
 
@@ -2270,8 +2317,8 @@ export class DubbingApp {
               <span>➡️ Siguiente Frase (${currentTakeNum + 1}/${totalTakes})</span>
             </button>
           ` : `
-            <button id="btn-take-finish" class="btn-take-primary" style="background: linear-gradient(135deg, var(--neon-cyan), #0088ff); color: #000; font-weight: 800;">
-              <span>🎬 ¡FINALIZAR Y VER RESULTADO!</span>
+            <button id="btn-take-finish" class="btn-take-primary" style="background: linear-gradient(135deg, var(--neon-green), #00a852); color: #000; font-weight: 800;">
+              <span>${allCharsDone ? '🎬 ¡FINALIZAR ESCENA COMPLETA!' : `➡️ Siguiente Personaje (${nextUnfinishedChar})`}</span>
             </button>
           `}
         </div>
@@ -3098,6 +3145,16 @@ export class DubbingApp {
       };
     }
 
+    const btnCharSaveFull = document.getElementById('btn-char-save-full');
+    if (btnCharSaveFull) {
+      btnCharSaveFull.onclick = () => this.saveCurrentDubbingSession();
+    }
+
+    const btnCharPlayFull = document.getElementById('btn-char-play-full');
+    if (btnCharPlayFull) {
+      btnCharPlayFull.onclick = () => this.playCurrentDubFromResults();
+    }
+
     document.querySelectorAll('.role-select-card').forEach(card => {
       card.onclick = () => {
         SFX.playClick();
@@ -3121,7 +3178,6 @@ export class DubbingApp {
       btnEnterStudio.onclick = async () => {
         this.playbackMode = 'dubbing';
         this.currentTakeIndex = 0;
-        this.userTakeRecordings.clear();
         this.navigate('take_studio');
         await this.setupTakeStudio();
       };
@@ -3133,6 +3189,28 @@ export class DubbingApp {
       btnTakeBackChar.onclick = () => {
         this.stopTakePlayback();
         this.navigate('character_select', { scene: this.selectedScene });
+      };
+    }
+
+    const btnTakeToChars = document.getElementById('btn-take-to-chars');
+    if (btnTakeToChars) {
+      btnTakeToChars.onclick = () => {
+        this.stopTakePlayback();
+        this.navigate('character_select', { scene: this.selectedScene });
+      };
+    }
+
+    const btnTakeNextChar = document.getElementById('btn-take-next-char');
+    if (btnTakeNextChar) {
+      btnTakeNextChar.onclick = async () => {
+        const nextChar = btnTakeNextChar.dataset.char;
+        if (nextChar) {
+          SFX.playClick();
+          this.selectedCharacter = nextChar;
+          this.currentTakeIndex = 0;
+          this.render();
+          await this.setupTakeStudio();
+        }
       };
     }
 
@@ -3189,6 +3267,11 @@ export class DubbingApp {
       btnTakeSaveDub.onclick = () => this.saveCurrentDubbingSession();
     }
 
+    const btnTakePlayFull = document.getElementById('btn-take-play-full');
+    if (btnTakePlayFull) {
+      btnTakePlayFull.onclick = () => this.playCurrentDubFromResults();
+    }
+
     document.querySelectorAll('.take-step-pill').forEach(pill => {
       pill.onclick = () => {
         const idx = parseInt(pill.dataset.takeIdx, 10);
@@ -3235,7 +3318,6 @@ export class DubbingApp {
         this.stopStudioPlayback();
         this.playbackMode = 'dubbing';
         this.currentTakeIndex = 0;
-        this.userTakeRecordings.clear();
         this.navigate('take_studio');
         await this.setupTakeStudio();
       };
@@ -3272,7 +3354,6 @@ export class DubbingApp {
         this.stopStudioPlayback();
         this.playbackMode = 'dubbing';
         this.currentTakeIndex = 0;
-        this.userTakeRecordings.clear();
         this.navigate('take_studio');
         await this.setupTakeStudio();
       };
@@ -3985,7 +4066,31 @@ export class DubbingApp {
       this.render();
       this.setupTakeStudio();
     } else {
-      this.assembleAndShowResults();
+      const characters = this.selectedScene?.characters || [];
+      const allDialogues = this.selectedScene?.dialogues || [];
+      const allCharsDone = characters.length > 0 && characters.every(c => {
+        const lines = allDialogues.filter(d => d.character.toLowerCase() === c.toLowerCase());
+        return lines.length > 0 && lines.every(d => this.userTakeRecordings.has(d.id));
+      });
+
+      if (allCharsDone) {
+        this.assembleAndShowResults();
+      } else {
+        const nextChar = characters.find(c => {
+          const lines = allDialogues.filter(d => d.character.toLowerCase() === c.toLowerCase());
+          return lines.length > 0 && !lines.every(d => this.userTakeRecordings.has(d.id));
+        });
+        if (nextChar) {
+          SFX.playSuccess();
+          this.showToast(`¡Completaste a ${this.selectedCharacter}! Ahora dobla a ${nextChar}.`, 'success');
+          this.selectedCharacter = nextChar;
+          this.currentTakeIndex = 0;
+          this.render();
+          this.setupTakeStudio();
+        } else {
+          this.assembleAndShowResults();
+        }
+      }
     }
   }
 
