@@ -401,15 +401,22 @@ export class DubbingApp {
     if (this.blobUrlCache.has(cacheKey)) return this.blobUrlCache.get(cacheKey);
 
     const keys = Object.keys(scene.rawFiles);
-    // 1. Check explicit scene.videoKey if valid
-    let videoKey = scene.videoKey && scene.rawFiles[scene.videoKey] ? scene.videoKey : null;
+    
+    // ALWAYS search and prioritize MP4 first (universal playback on Mac, iOS, Android, PC)
+    let videoKey = keys.find(k => k.toLowerCase().endsWith('.mp4')) ||
+                   keys.find(k => k.toLowerCase().endsWith('.webm')) ||
+                   keys.find(k => k.toLowerCase().endsWith('.mov') || k.toLowerCase().endsWith('.m4v'));
 
-    // 2. Search by extension prioritizing universal formats
+    // If explicit videoKey is set and ends with MP4 or WebM, use it
+    if (!videoKey && scene.videoKey && scene.rawFiles[scene.videoKey] && !scene.videoKey.toLowerCase().endsWith('.ogv')) {
+      videoKey = scene.videoKey;
+    }
+
+    // Last resort fallback (OGV/MKV)
     if (!videoKey) {
-      videoKey = keys.find(k => k.toLowerCase().endsWith('.mp4')) ||
-                 keys.find(k => k.toLowerCase().endsWith('.webm')) ||
-                 keys.find(k => k.toLowerCase().endsWith('.ogv') || k.toLowerCase().endsWith('.ogg')) ||
-                 keys.find(k => k.toLowerCase().endsWith('.mov') || k.toLowerCase().endsWith('.m4v') || k.toLowerCase().endsWith('.mkv'));
+      videoKey = keys.find(k => k.toLowerCase().endsWith('.ogv') || k.toLowerCase().endsWith('.ogg')) ||
+                 keys.find(k => k.toLowerCase().endsWith('.mkv')) ||
+                 (scene.videoKey && scene.rawFiles[scene.videoKey] ? scene.videoKey : null);
     }
 
     if (videoKey && scene.rawFiles[videoKey]) {
@@ -3650,9 +3657,10 @@ export class DubbingApp {
     const videoEl = document.getElementById('take-video');
     if (videoEl) {
       videoEl.muted = true;
-      if (!videoEl.src || videoEl.src === window.location.href) {
-        const vUrl = this.getVideoUrl(this.selectedScene);
-        if (vUrl) videoEl.src = vUrl;
+      const vUrl = this.getVideoUrl(this.selectedScene);
+      if (vUrl && (!videoEl.src || videoEl.src === window.location.href)) {
+        videoEl.src = vUrl;
+        videoEl.load();
       }
       const seekTime = activeDiag.timestamp || 0;
       if (videoEl.readyState >= 1) {
@@ -3775,9 +3783,9 @@ export class DubbingApp {
 
     try {
       videoEl.muted = true;
-      if (!videoEl.src || videoEl.src === window.location.href) {
-        const vUrl = this.getVideoUrl(this.selectedScene);
-        if (vUrl) videoEl.src = vUrl;
+      const vUrl = this.getVideoUrl(this.selectedScene);
+      if (vUrl && (!videoEl.src || videoEl.src === window.location.href)) {
+        videoEl.src = vUrl;
       }
       const targetTime = Math.max(0, startTime || 0);
       try {
@@ -3785,13 +3793,14 @@ export class DubbingApp {
       } catch (seekErr) {
         console.warn('Video seek warning:', seekErr);
       }
+      videoEl.removeAttribute('poster');
       const p = videoEl.play();
       if (p && typeof p.catch === 'function') {
         p.catch(e => console.warn('Video play warning:', e));
       }
       return {
         videoEl,
-        offset: Math.max(0, (videoEl.currentTime || targetTime) - targetTime)
+        offset: 0
       };
     } catch (e) {
       console.warn('Take video notice:', e);
@@ -3831,43 +3840,37 @@ export class DubbingApp {
     ctx.lineTo(w, centerY);
     ctx.stroke();
 
-    const peaks = refPeaks || new Float32Array(80).fill(0.2);
-    const numBars = peaks.length;
-    const barWidth = (w / numBars);
+    const numBars = refPeaks.length;
+    const barWidth = w / numBars;
 
-    // 3. Draw Reference Waveform (Layered Magenta / Purple / Pink)
-    ctx.shadowBlur = 10 * dpr;
-    ctx.shadowColor = 'rgba(219, 0, 146, 0.7)';
-
+    // 3. Draw Reference Waveform (Cyan / White Neon Bars)
     for (let i = 0; i < numBars; i++) {
+      const val = refPeaks[i];
+      const barHeight = Math.max(2 * dpr, val * (h * 0.42));
       const x = i * barWidth;
-      const amp = Math.max(0.05, peaks[i]);
-      const barHeight = amp * (h * 0.42);
+      const isPast = (x / w) <= playheadRatio;
 
-      // Layer 1: Deep Purple base
-      ctx.fillStyle = '#6a1078';
-      ctx.fillRect(x, centerY - barHeight * 1.1, barWidth - 1, barHeight * 2.2);
+      if (isPast) {
+        ctx.fillStyle = '#00f0ff';
+        ctx.shadowBlur = 6 * dpr;
+        ctx.shadowColor = '#00f0ff';
+      } else {
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+        ctx.shadowBlur = 0;
+      }
 
-      // Layer 2: Vivid Magenta
-      ctx.fillStyle = '#db0092';
-      ctx.fillRect(x + 0.5 * dpr, centerY - barHeight * 0.85, barWidth - 1.5 * dpr, barHeight * 1.7);
-
-      // Layer 3: Bright Neon Pink core
-      ctx.fillStyle = '#ff4dc4';
-      ctx.fillRect(x + 1 * dpr, centerY - barHeight * 0.45, barWidth - 2.5 * dpr, barHeight * 0.9);
+      ctx.fillRect(x + 0.5 * dpr, centerY - barHeight, barWidth - 1 * dpr, barHeight * 2);
     }
     ctx.shadowBlur = 0;
 
-    // 4. Draw User Recorded / Live Voice Waveform Overlaid (Teal / Cyan / White)
-    const userPeaks = userRecordedPeaks || userLiveHistory;
+    // 4. Draw User Live or Recorded Waveform overlay (Electric Pink)
+    const userPeaks = userLiveHistory || userRecordedPeaks;
     if (userPeaks && userPeaks.length > 0) {
       const userStep = w / userPeaks.length;
       for (let i = 0; i < userPeaks.length; i++) {
+        const uVal = userPeaks[i];
+        const uHeight = Math.max(2 * dpr, uVal * (h * 0.42));
         const x = i * userStep;
-        if (x > playheadRatio * w && !userRecordedPeaks) break;
-
-        const uAmp = Math.max(0.04, userPeaks[i]);
-        const uHeight = uAmp * (h * 0.44);
 
         // Teal / Cyan glow overlay
         ctx.fillStyle = 'rgba(0, 240, 255, 0.75)';
@@ -3920,25 +3923,19 @@ export class DubbingApp {
     const diagBuf = this.dialogueAudios.get(activeDiag.id);
     const duration = (diagBuf && diagBuf.duration > 0.3) ? diagBuf.duration : (activeDiag.duration || 3.5);
 
-    // Let the native video frame start first, then align every audio source to
-    // that exact frame. This avoids an independent wall clock drifting away.
-    const segment = await this.startTakeVideoSegment(activeDiag.timestamp || 0);
-    if (!segment) return;
-    const { videoEl, offset: videoOffset } = segment;
-    const remainingDuration = Math.max(0.05, duration - videoOffset);
+    // Start video playback
+    await this.startTakeVideoSegment(activeDiag.timestamp || 0);
 
     // Play dialogue audio buffer or slice
     let audioPlaying = false;
     const buf = this.dialogueAudios.get(activeDiag.id);
     if (buf) {
-      const audioOffset = Math.min(videoOffset, Math.max(0, buf.duration - 0.01));
-      this.activeTakeAudioSource = this.audio.playBufferSlice(buf, audioOffset, Math.max(0.05, buf.duration - audioOffset), 'original');
+      this.activeTakeAudioSource = this.audio.playBufferSlice(buf, 0, buf.duration, 'original');
       audioPlaying = true;
     } else {
       const diagUrl = this.getDialogueAudioUrl(this.selectedScene, activeDiag);
       if (diagUrl) {
         const audioEl = new Audio(diagUrl);
-        audioEl.currentTime = videoOffset;
         audioEl.volume = this.audio.volumes.original;
         audioEl.play().catch(() => {});
         this.activeTakeMediaEl = audioEl;
@@ -3949,16 +3946,16 @@ export class DubbingApp {
     // If no isolated dialogue audio (dub_only mod), play from backing track!
     if (!audioPlaying) {
       if (this.backingBuffer) {
-        this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, (activeDiag.timestamp || 0) + videoOffset, remainingDuration, 'backing');
+        this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, duration, 'backing');
       } else if (this.backingAudioEl) {
-        this.backingAudioEl.currentTime = (activeDiag.timestamp || 0) + videoOffset;
+        this.backingAudioEl.currentTime = activeDiag.timestamp || 0;
         this.backingAudioEl.volume = this.audio.volumes.backing || 0.8;
         this.backingAudioEl.play().catch(() => {});
       } else {
         const backingUrl = this.getBackingAudioUrl(this.selectedScene);
         if (backingUrl) {
           const audioEl = new Audio(backingUrl);
-          audioEl.currentTime = (activeDiag.timestamp || 0) + videoOffset;
+          audioEl.currentTime = activeDiag.timestamp || 0;
           audioEl.volume = this.audio.volumes.backing || 0.8;
           audioEl.play().catch(() => {});
           this.backingAudioEl = audioEl;
@@ -3966,15 +3963,12 @@ export class DubbingApp {
       }
     }
 
-    // Animate the playhead from the video position, not performance.now().
-    const fallbackStartTime = performance.now() - (videoOffset * 1000);
+    const startTime = performance.now();
     this.isTakePlayingRef = true;
 
     const animate = () => {
       if (!this.isTakePlayingRef) return;
-      const elapsed = videoEl
-        ? Math.max(0, videoEl.currentTime - (activeDiag.timestamp || 0))
-        : (performance.now() - fallbackStartTime) / 1000;
+      const elapsed = (performance.now() - startTime) / 1000;
       const ratio = Math.min(1.0, elapsed / duration);
 
       this.drawWaveform(canvas, refPeaks, ratio, null, existingTake?.peaks || null);
@@ -4031,24 +4025,21 @@ export class DubbingApp {
     if (avatarStatus) avatarStatus.textContent = '🎙️ ¡Grabando tu voz!';
     if (avatarOverlay) avatarOverlay.classList.add('speaking');
 
-    const segment = await this.startTakeVideoSegment(activeDiag.timestamp || 0);
-    if (!segment) return;
-    const { videoEl, offset: videoOffset } = segment;
-    const remainingPhraseDuration = Math.max(0.05, phraseDuration - videoOffset);
+    // Start video playback
+    await this.startTakeVideoSegment(activeDiag.timestamp || 0);
 
-    // Keep accompaniment aligned with the same video frame. The video stops at
-    // the end of the reference phrase instead of continuing past its playhead.
+    // Play accompaniment
     if (this.backingBuffer) {
-      this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, (activeDiag.timestamp || 0) + videoOffset, remainingPhraseDuration, 'backing');
+      this.activeTakeAudioSource = this.audio.playBufferSlice(this.backingBuffer, activeDiag.timestamp || 0, phraseDuration, 'backing');
     } else if (this.backingAudioEl) {
-      this.backingAudioEl.currentTime = (activeDiag.timestamp || 0) + videoOffset;
+      this.backingAudioEl.currentTime = activeDiag.timestamp || 0;
       this.backingAudioEl.volume = (this.audio.volumes.backing || 0.8) * 0.7;
       this.backingAudioEl.play().catch(() => {});
     } else {
       const backingUrl = this.getBackingAudioUrl(this.selectedScene);
       if (backingUrl) {
         const audioEl = new Audio(backingUrl);
-        audioEl.currentTime = (activeDiag.timestamp || 0) + videoOffset;
+        audioEl.currentTime = activeDiag.timestamp || 0;
         audioEl.volume = (this.audio.volumes.backing || 0.8) * 0.7;
         audioEl.play().catch(() => {});
         this.backingAudioEl = audioEl;
