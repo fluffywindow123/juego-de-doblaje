@@ -293,20 +293,53 @@ export class DubbingApp {
     if (rawData instanceof ArrayBuffer) {
       return new Blob([rawData], { type: mimeType });
     }
-    if (typeof rawData === 'object' && rawData.buffer && (rawData.byteLength !== undefined || rawData.length !== undefined)) {
+    // TypedArray views (Int8Array, etc.)
+    if (ArrayBuffer.isView(rawData)) {
+      return new Blob([rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength)], { type: mimeType });
+    }
+    if (typeof rawData === 'object' && rawData.buffer instanceof ArrayBuffer) {
       const u8 = new Uint8Array(rawData.buffer, rawData.byteOffset || 0, rawData.byteLength || rawData.length);
       return new Blob([u8], { type: mimeType });
     }
+    // IndexedDB deserializes Uint8Array as plain objects {0:byte, 1:byte, ...}
+    // For large data (video files ~12MB), the byte-by-byte loop is too slow.
+    // Use a chunked approach with pre-allocated ArrayBuffer.
     if (typeof rawData === 'object') {
       try {
-        const len = rawData.length || Object.keys(rawData).length;
-        const u8 = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-          u8[i] = rawData[i];
+        // Determine length: prefer .length, then count numeric keys
+        let len = rawData.length;
+        if (len === undefined || len === null) {
+          // Find the highest numeric key to determine true length
+          const numericKeys = Object.keys(rawData).filter(k => !isNaN(k));
+          if (numericKeys.length === 0) {
+            return new Blob([JSON.stringify(rawData)], { type: mimeType });
+          }
+          len = Math.max(...numericKeys.map(Number)) + 1;
         }
-        return new Blob([u8], { type: mimeType });
+        if (len <= 0) return null;
+
+        // Pre-allocate entire buffer at once
+        const ab = new ArrayBuffer(len);
+        const u8 = new Uint8Array(ab);
+
+        // Fill in 64KB chunks to avoid blocking the main thread
+        const CHUNK = 65536;
+        for (let offset = 0; offset < len; offset += CHUNK) {
+          const end = Math.min(offset + CHUNK, len);
+          for (let i = offset; i < end; i++) {
+            u8[i] = rawData[i] || 0;
+          }
+        }
+
+        const blob = new Blob([ab], { type: mimeType });
+        if (blob.size === 0 && len > 0) {
+          console.warn('[toBlob] Generated zero-size blob from', len, 'bytes, mime:', mimeType);
+          return null;
+        }
+        return blob;
       } catch (e) {
-        return new Blob([rawData], { type: mimeType });
+        console.warn('[toBlob] Error converting object to blob:', e);
+        return null;
       }
     }
     return new Blob([rawData], { type: mimeType });
@@ -981,20 +1014,53 @@ export class DubbingApp {
     this.playDubPlayedIds.clear();
 
     // 1. Decode all user recorded takes into AudioBuffers
+    // Handles 3 storage formats:
+    //   a) take.audioData (ArrayBuffer) — new format, survives IndexedDB
+    //   b) take.audioBlob (Blob) — in-memory from current session
+    //   c) take.audioBlob (deserialized object) — old format from IndexedDB
     const takes = dubRecord.takes || [];
     for (const take of takes) {
-      if (take.audioBlob) {
-        try {
-          const arrayBuf = await take.audioBlob.arrayBuffer();
+      try {
+        let arrayBuf = null;
+
+        // Format A: audioData is an ArrayBuffer (new saves)
+        if (take.audioData) {
+          if (take.audioData instanceof ArrayBuffer) {
+            arrayBuf = take.audioData;
+          } else if (take.audioData instanceof Blob) {
+            arrayBuf = await take.audioData.arrayBuffer();
+          } else if (typeof take.audioData === 'object') {
+            // Deserialized from IndexedDB as plain object
+            const blob = this.toBlob(take.audioData, take.audioMimeType || 'audio/webm');
+            if (blob) arrayBuf = await blob.arrayBuffer();
+          }
+        }
+
+        // Format B: audioBlob is a real Blob (in-memory playback)
+        if (!arrayBuf && take.audioBlob) {
+          if (take.audioBlob instanceof Blob) {
+            arrayBuf = await take.audioBlob.arrayBuffer();
+          } else if (typeof take.audioBlob === 'object') {
+            // Format C: audioBlob deserialized from IndexedDB as plain object
+            const blob = this.toBlob(take.audioBlob, 'audio/webm');
+            if (blob && blob.size > 0) {
+              arrayBuf = await blob.arrayBuffer();
+            }
+          }
+        }
+
+        if (arrayBuf && arrayBuf.byteLength > 0) {
           const audioBuf = await this.audio.decodeAudio(arrayBuf, `user_dub_${take.dialogueId}`);
           if (audioBuf) {
             this.playDubUserBuffers.set(take.dialogueId, audioBuf);
           }
-        } catch (e) {
-          console.warn('Could not decode user take:', e);
         }
+      } catch (e) {
+        console.warn('[setupPlayDub] Could not decode user take:', take.dialogueId, e);
       }
     }
+
+    console.log(`[setupPlayDub] Decoded ${this.playDubUserBuffers.size} of ${takes.length} user takes`);
 
     // 2. Prepare backing audio
     const backingUrl = this.getBackingAudioUrl(sceneSnapshot);
@@ -1034,12 +1100,43 @@ export class DubbingApp {
       }
     }
 
-    // Play video
+    // Play video — ensure source is loaded and ready
     const videoEl = document.getElementById('play-dub-video');
     if (videoEl) {
-      videoEl.currentTime = this.currentTime;
       videoEl.muted = true;
-      videoEl.play().catch(() => {});
+      const sceneForVideo = sceneSnapshot;
+      const vUrl = this.getVideoUrl(sceneForVideo);
+      if (vUrl && videoEl.src !== vUrl) {
+        videoEl.src = vUrl;
+        videoEl.load();
+      }
+
+      // Wait for video data if needed
+      if (videoEl.readyState < 2 && vUrl) {
+        await new Promise((resolve) => {
+          const onReady = () => {
+            videoEl.removeEventListener('canplay', onReady);
+            videoEl.removeEventListener('loadeddata', onReady);
+            clearTimeout(timeout);
+            resolve();
+          };
+          videoEl.addEventListener('canplay', onReady, { once: true });
+          videoEl.addEventListener('loadeddata', onReady, { once: true });
+          const timeout = setTimeout(() => {
+            videoEl.removeEventListener('canplay', onReady);
+            videoEl.removeEventListener('loadeddata', onReady);
+            resolve();
+          }, 4000);
+        });
+      }
+
+      videoEl.currentTime = this.currentTime;
+      videoEl.removeAttribute('poster');
+      try {
+        await videoEl.play();
+      } catch (e) {
+        console.warn('[startPlayDubLoop] Video play warning:', e);
+      }
     }
 
     // Play backing track
@@ -1206,13 +1303,28 @@ export class DubbingApp {
     for (const d of allDialogues) {
       const takeData = this.userTakeRecordings.get(d.id);
       if (takeData) {
+        // Convert Blob to ArrayBuffer for IndexedDB storage
+        // Blobs can lose their type when deserialized from IndexedDB,
+        // but ArrayBuffer is a structured-clonable type that survives perfectly.
+        let audioData = takeData.blob;
+        let audioMimeType = 'audio/webm';
+        if (audioData instanceof Blob) {
+          audioMimeType = audioData.type || 'audio/webm';
+          try {
+            audioData = await audioData.arrayBuffer();
+          } catch (e) {
+            console.warn('[saveCurrentDubbingSession] Could not convert blob to arrayBuffer:', e);
+          }
+        }
         takesArray.push({
           dialogueId: d.id,
           character: d.character,
           caption: d.caption,
           timestamp: d.timestamp,
           duration: d.duration,
-          audioBlob: takeData.blob,
+          audioData: audioData,       // ArrayBuffer — survives IndexedDB
+          audioMimeType: audioMimeType, // Remember the MIME type
+          audioBlob: null,            // Don't store Blob (won't survive IndexedDB)
           peaks: Array.from(takeData.peaks || []),
           score: takeData.score || 92
         });
@@ -3784,26 +3896,58 @@ export class DubbingApp {
     try {
       videoEl.muted = true;
       const vUrl = this.getVideoUrl(this.selectedScene);
-      if (vUrl && (!videoEl.src || videoEl.src === window.location.href)) {
-        videoEl.src = vUrl;
+      if (!vUrl) {
+        console.warn('[startTakeVideoSegment] No video URL available');
+        return { videoEl: null, offset: 0 };
       }
+
+      // Always re-assign src to ensure fresh blob URL is used
+      // (IndexedDB data may have changed since last load)
+      if (videoEl.src !== vUrl) {
+        videoEl.src = vUrl;
+        videoEl.load();
+      }
+
       const targetTime = Math.max(0, startTime || 0);
+
+      // Wait for the video to have enough data to seek and play
+      if (videoEl.readyState < 2) {
+        await new Promise((resolve) => {
+          const onReady = () => {
+            videoEl.removeEventListener('canplay', onReady);
+            videoEl.removeEventListener('loadeddata', onReady);
+            clearTimeout(timeout);
+            resolve();
+          };
+          videoEl.addEventListener('canplay', onReady, { once: true });
+          videoEl.addEventListener('loadeddata', onReady, { once: true });
+          // Timeout after 4 seconds so we don't hang forever
+          const timeout = setTimeout(() => {
+            videoEl.removeEventListener('canplay', onReady);
+            videoEl.removeEventListener('loadeddata', onReady);
+            console.warn('[startTakeVideoSegment] Video load timeout, proceeding anyway');
+            resolve();
+          }, 4000);
+        });
+      }
+
       try {
         videoEl.currentTime = targetTime;
       } catch (seekErr) {
-        console.warn('Video seek warning:', seekErr);
+        console.warn('[startTakeVideoSegment] Video seek warning:', seekErr);
       }
+
       videoEl.removeAttribute('poster');
-      const p = videoEl.play();
-      if (p && typeof p.catch === 'function') {
-        p.catch(e => console.warn('Video play warning:', e));
+
+      try {
+        await videoEl.play();
+      } catch (playErr) {
+        console.warn('[startTakeVideoSegment] Video play warning:', playErr);
       }
-      return {
-        videoEl,
-        offset: 0
-      };
+
+      return { videoEl, offset: 0 };
     } catch (e) {
-      console.warn('Take video notice:', e);
+      console.warn('[startTakeVideoSegment] Error:', e);
       return { videoEl, offset: 0 };
     }
   }
@@ -4155,18 +4299,7 @@ export class DubbingApp {
     const playDuration = Math.max(phraseDuration, take.duration || 3.5);
 
     // Start video
-    const videoEl = document.getElementById('take-video');
-    if (videoEl) {
-      videoEl.muted = true;
-      if (!videoEl.src || videoEl.src === window.location.href) {
-        const vUrl = this.getVideoUrl(this.selectedScene);
-        if (vUrl) videoEl.src = vUrl;
-      }
-      try {
-        videoEl.currentTime = activeDiag.timestamp || 0;
-      } catch {}
-      videoEl.play().catch(() => {});
-    }
+    await this.startTakeVideoSegment(activeDiag.timestamp || 0);
 
     // Play backing track in background
     if (this.backingBuffer) {
@@ -4340,13 +4473,15 @@ export class DubbingApp {
     for (const d of allDialogues) {
       const takeData = this.userTakeRecordings.get(d.id);
       if (takeData) {
+        // For in-memory playback (from results screen), keep the Blob directly
+        // since we haven't gone through IndexedDB yet
         takesArray.push({
           dialogueId: d.id,
           character: d.character,
           caption: d.caption,
           timestamp: d.timestamp,
           duration: d.duration,
-          audioBlob: takeData.blob,
+          audioBlob: takeData.blob,  // Still valid Blob from memory
           peaks: Array.from(takeData.peaks || []),
           score: takeData.score || 92
         });
