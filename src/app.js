@@ -1043,91 +1043,97 @@ export class DubbingApp {
     this.render();
 
     try {
-      let data = null;
+      let scenes = [];
+      let total = 0;
 
-      // 1. Try local server proxy first
+      // 1. Try local server proxy first (if on localhost or custom server)
       try {
         const searchParam = searchQuery ? `&search=${encodeURIComponent(searchQuery)}` : '';
         const res = await fetch(`/api/gamebanana/feed?page=${page}${searchParam}`);
         if (res.ok) {
-          data = await res.json();
+          const data = await res.json();
+          if (data.success && data.scenes && data.scenes.length > 0) {
+            scenes = data.scenes;
+            total = data.total || scenes.length;
+          }
         }
       } catch (e) {}
 
-      // 2. Direct GameBanana API fallback (works natively on GitHub Pages!)
-      if (!data || !data.success || !data.scenes || data.scenes.length === 0) {
-        const GAME_ID = 20674;
-        let apiUrl = '';
-        if (searchQuery && searchQuery.trim().length > 0) {
-          apiUrl = `https://gamebanana.com/apiv11/Util/Search/Results?_sSearchString=${encodeURIComponent(searchQuery.trim())}&_idGameRow=${GAME_ID}&_nPage=${page}&_nPerpage=24`;
-        } else {
-          apiUrl = `https://gamebanana.com/apiv11/Game/${GAME_ID}/Subfeed?_nPage=${page}&_nPerpage=24`;
-        }
+      // 2. Try static embedded scenes catalog (works 100% on GitHub Pages without CORS restrictions!)
+      if (scenes.length === 0) {
+        try {
+          if (!this.cachedCatalog) {
+            const catRes = await fetch('./scenes_catalog.json');
+            if (catRes.ok) {
+              this.cachedCatalog = await catRes.json();
+            }
+          }
 
-        let rawData = null;
+          if (this.cachedCatalog && this.cachedCatalog.length > 0) {
+            let filtered = this.cachedCatalog;
+            if (searchQuery && searchQuery.trim().length > 0) {
+              const q = searchQuery.toLowerCase().trim();
+              filtered = this.cachedCatalog.filter(s => 
+                (s.title && s.title.toLowerCase().includes(q)) || 
+                (s.author && s.author.toLowerCase().includes(q)) ||
+                (s.category && s.category.toLowerCase().includes(q))
+              );
+            }
+            total = filtered.length;
+            const pageSize = 24;
+            const startIdx = (page - 1) * pageSize;
+            scenes = filtered.slice(startIdx, startIdx + pageSize);
+          }
+        } catch (catErr) {
+          console.warn('Could not load scenes_catalog.json:', catErr);
+        }
+      }
+
+      // 3. Direct GameBanana API attempt as extra fallback
+      if (scenes.length === 0) {
+        const GAME_ID = 20674;
+        let apiUrl = searchQuery && searchQuery.trim().length > 0
+          ? `https://gamebanana.com/apiv11/Util/Search/Results?_sSearchString=${encodeURIComponent(searchQuery.trim())}&_idGameRow=${GAME_ID}&_nPage=${page}&_nPerpage=24`
+          : `https://gamebanana.com/apiv11/Game/${GAME_ID}/Subfeed?_nPage=${page}&_nPerpage=24`;
+
         try {
           const gbRes = await fetch(apiUrl);
           if (gbRes.ok) {
-            rawData = await gbRes.json();
-          }
-        } catch (err) {
-          console.warn('Direct GameBanana fetch failed, trying CORS proxy:', err);
-        }
-
-        // 3. CORS Proxy Fallback (if browser extensions or adblockers block direct API)
-        if (!rawData || !rawData._aRecords) {
-          try {
-            const proxyRes = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(apiUrl)}`);
-            if (proxyRes.ok) {
-              rawData = await proxyRes.json();
+            const rawData = await gbRes.json();
+            if (rawData && rawData._aRecords) {
+              scenes = rawData._aRecords.map(item => {
+                let thumb = '';
+                const previewImages = item._aPreviewMedia?._aImages || [];
+                if (previewImages.length > 0) {
+                  const firstImg = previewImages[0];
+                  thumb = `${firstImg._sBaseUrl}/${firstImg._sFile530 || firstImg._sFile220 || firstImg._sFile}`;
+                }
+                return {
+                  id: item._idRow,
+                  title: item._sName || 'Escena Sin Título',
+                  author: item._aSubmitter?._sName || 'Comunidad',
+                  authorAvatar: item._aSubmitter?._sAvatarUrl || '',
+                  thumbnailUrl: thumb,
+                  dateAdded: item._tsDateAdded,
+                  likes: item._nLikeCount || 0,
+                  views: item._nViewCount || 0,
+                  category: item._aRootCategory?._sName || 'Dub Mode',
+                  profileUrl: item._sProfileUrl || `https://gamebanana.com/mods/${item._idRow}`
+                };
+              });
+              total = rawData._aMetadata?._nRecordCount || scenes.length;
             }
-          } catch (proxyErr) {
-            console.warn('Proxy fetch failed:', proxyErr);
           }
-        }
-
-        if (rawData && rawData._aRecords) {
-          const records = rawData._aRecords || [];
-          const scenes = records.map(item => {
-            let thumb = '';
-            const previewImages = item._aPreviewMedia?._aImages || [];
-            if (previewImages.length > 0) {
-              const firstImg = previewImages[0];
-              thumb = `${firstImg._sBaseUrl}/${firstImg._sFile530 || firstImg._sFile220 || firstImg._sFile}`;
-            }
-
-            return {
-              id: item._idRow,
-              title: item._sName || 'Escena Sin Título',
-              author: item._aSubmitter?._sName || 'Comunidad',
-              authorAvatar: item._aSubmitter?._sAvatarUrl || '',
-              thumbnailUrl: thumb,
-              dateAdded: item._tsDateAdded,
-              likes: item._nLikeCount || 0,
-              views: item._nViewCount || 0,
-              category: item._aRootCategory?._sName || 'Dub Mode',
-              profileUrl: item._sProfileUrl || `https://gamebanana.com/mods/${item._idRow}`
-            };
-          });
-
-          data = {
-            success: true,
-            page,
-            total: rawData?._aMetadata?._nRecordCount || scenes.length,
-            scenes
-          };
+        } catch (gbErr) {
+          console.warn('GameBanana direct API blocked:', gbErr);
         }
       }
 
-      if (data && data.success && data.scenes) {
-        this.onlineScenes = data.scenes;
-        this.onlineTotal = data.total || this.onlineScenes.length;
-      } else {
-        this.showToast('Error cargando escenas de GameBanana.', 'error');
-      }
+      this.onlineScenes = scenes;
+      this.onlineTotal = total || scenes.length;
     } catch (err) {
-      console.error('Error fetching online scenes:', err);
-      this.showToast('No se pudo conectar con GameBanana.', 'error');
+      console.error('Error in loadOnlineScenes:', err);
+      this.showToast('Error cargando escenas online.', 'error');
     } finally {
       this.isOnlineLoading = false;
       this.render();
