@@ -4738,7 +4738,13 @@ export class DubbingApp {
     if (!videoEl) return true;
 
     try {
-      videoEl.muted = true;
+      const isOriginalMode = this.playbackMode === 'original';
+      // In original playback mode, unmute the video to play its original audio track with all characters voices!
+      videoEl.muted = !isOriginalMode;
+      if (isOriginalMode) {
+        videoEl.volume = Math.max(0, Math.min(1.0, this.audio.volumes.original || 1.0));
+      }
+
       const vUrl = this.getVideoUrl(this.selectedScene);
 
       // Check if browser can play this video MIME directly (macOS/Safari cannot decode OGV natively)
@@ -4750,7 +4756,10 @@ export class DubbingApp {
         if (!videoEl._ogvPlayer) {
           try {
             const player = new window.OGVPlayer();
-            player.muted = true;
+            player.muted = !isOriginalMode;
+            if (isOriginalMode) {
+              player.volume = Math.max(0, Math.min(1.0, this.audio.volumes.original || 1.0));
+            }
             player.src = vUrl;
             player.style.width = '100%';
             player.style.height = '100%';
@@ -4767,6 +4776,7 @@ export class DubbingApp {
           }
         }
         if (videoEl._ogvPlayer) {
+          videoEl._ogvPlayer.muted = !isOriginalMode;
           try { videoEl._ogvPlayer.currentTime = this.currentTime; } catch {}
           try { await videoEl._ogvPlayer.play(); } catch {}
           return true;
@@ -4906,13 +4916,16 @@ export class DubbingApp {
 
     const btnPlay = document.getElementById('btn-play-original-mode');
     if (btnPlay) {
-      btnPlay.innerHTML = `<span>▶️</span> <span>REANUDAR REPRODUCCIÓN</span>`;
+      btnPlay.innerHTML = `<span>▶️</span> <span>REPRODUCIR ESCENA</span>`;
       btnPlay.style.background = 'linear-gradient(135deg, var(--neon-green), #00a653)';
       btnPlay.style.color = '#000';
     }
 
     const videoEl = document.getElementById('studio-video');
     if (videoEl) {
+      if (videoEl._ogvPlayer && typeof videoEl._ogvPlayer.pause === 'function') {
+        try { videoEl._ogvPlayer.pause(); } catch {}
+      }
       this.currentTime = videoEl.currentTime || this.currentTime;
       videoEl.pause();
     }
