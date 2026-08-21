@@ -495,16 +495,62 @@ export class DubbingApp {
     const cacheKey = `diag_${scene.id}_${dialogue.id}`;
     if (this.blobUrlCache.has(cacheKey)) return this.blobUrlCache.get(cacheKey);
 
-    const audioKey = dialogue.audioKey || Object.keys(scene.rawFiles).find(k => k.includes(dialogue.id) && (k.endsWith('.mp3') || k.endsWith('.ogg') || k.endsWith('.wav')));
-    if (audioKey && scene.rawFiles[audioKey]) {
-      const mime = audioKey.endsWith('.ogg') ? 'audio/ogg' : (audioKey.endsWith('.wav') ? 'audio/wav' : 'audio/mpeg');
-      const blob = this.toBlob(scene.rawFiles[audioKey], mime);
+    const rawFiles = scene.rawFiles;
+    const fileKeys = Object.keys(rawFiles);
+
+    // 1. Direct match by dialogue.audioKey
+    if (dialogue.audioKey && rawFiles[dialogue.audioKey]) {
+      const mime = dialogue.audioKey.endsWith('.ogg') ? 'audio/ogg' : (dialogue.audioKey.endsWith('.wav') ? 'audio/wav' : 'audio/mpeg');
+      const blob = this.toBlob(rawFiles[dialogue.audioKey], mime);
       if (blob) {
         const url = URL.createObjectURL(blob);
         this.blobUrlCache.set(cacheKey, url);
         return url;
       }
     }
+
+    // 2. Match by audio_file metadata
+    if (dialogue.audio_file) {
+      const match = fileKeys.find(k => k === dialogue.audio_file || k.endsWith('/' + dialogue.audio_file) || k.endsWith(dialogue.audio_file));
+      if (match && rawFiles[match]) {
+        const mime = match.endsWith('.ogg') ? 'audio/ogg' : (match.endsWith('.wav') ? 'audio/wav' : 'audio/mpeg');
+        const blob = this.toBlob(rawFiles[match], mime);
+        if (blob) {
+          const url = URL.createObjectURL(blob);
+          this.blobUrlCache.set(cacheKey, url);
+          return url;
+        }
+      }
+    }
+
+    // 3. Match by dialogue ID substring
+    const idLower = dialogue.id.toLowerCase();
+    let matchKey = fileKeys.find(k => {
+      const lower = k.toLowerCase();
+      return lower.includes(idLower) && (lower.endsWith('.mp3') || lower.endsWith('.ogg') || lower.endsWith('.wav'));
+    });
+
+    // 4. Match by index prefix (e.g. "01_", "02_")
+    if (!matchKey) {
+      const numPrefix = dialogue.id.match(/^(\d+)/)?.[1];
+      if (numPrefix) {
+        matchKey = fileKeys.find(k => {
+          const fileName = k.substring(k.lastIndexOf('/') + 1).toLowerCase();
+          return fileName.startsWith(numPrefix) && (fileName.endsWith('.mp3') || fileName.endsWith('.ogg') || fileName.endsWith('.wav'));
+        });
+      }
+    }
+
+    if (matchKey && rawFiles[matchKey]) {
+      const mime = matchKey.endsWith('.ogg') ? 'audio/ogg' : (matchKey.endsWith('.wav') ? 'audio/wav' : 'audio/mpeg');
+      const blob = this.toBlob(rawFiles[matchKey], mime);
+      if (blob) {
+        const url = URL.createObjectURL(blob);
+        this.blobUrlCache.set(cacheKey, url);
+        return url;
+      }
+    }
+
     return '';
   }
 
@@ -1522,16 +1568,20 @@ export class DubbingApp {
               <button class="btn-card-play" style="width:100%; background:rgba(0,255,136,0.15); border:1px solid var(--neon-green); color:var(--neon-green); cursor:default;">
                 ✓ Ya en tu Biblioteca
               </button>
+            ` : (queueItem ? `
+              <button class="btn-card-play" style="width:100%; background:rgba(234,179,8,0.2); border:1px solid #eab308; color:#fff; cursor:default;">
+                ${queueItem.status === 'completed' ? '✅ Descargada' : `⏳ ${queueItem.status === 'downloading' ? `${queueItem.percent}%` : 'En cola'}`}
+              </button>
             ` : `
               <div style="display:flex; gap:0.4rem;">
-                <a href="${mod.profileUrl}#FileInfo_1" target="_blank" class="btn-card-play" style="text-decoration:none; display:flex; align-items:center; justify-content:center; flex:1; background: linear-gradient(135deg, var(--neon-cyan), #0088ff); color: #000; font-weight:800; padding:0.6rem 0.8rem; font-size:0.9rem;" title="Descargar archivo ZIP directamente a las descargas de Chrome">
-                  ⬇️ Descargar ZIP (Chrome)
-                </a>
-                <button class="btn-icon-action btn-add-queue" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" title="Procesar automáticamente">
-                  📥
+                <button class="btn-card-play btn-download-single-mod" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" style="flex:1; background: linear-gradient(135deg, var(--neon-cyan), #0088ff); color: #000; font-weight:800; padding:0.6rem 0.8rem; font-size:0.9rem;" title="Descargar e integrar directamente en el juego">
+                  📥 Descargar al Juego
                 </button>
+                <a href="${mod.profileUrl}#FileInfo_1" target="_blank" class="btn-icon-action" style="text-decoration:none; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.08); border:1px solid var(--border-glass); border-radius:var(--radius-md); padding:0 0.6rem; color:#fff;" title="Descarga de respaldo en Chrome">
+                  ⚡
+                </a>
               </div>
-            `}
+            `)}
           </div>
         </div>
       </div>
@@ -4141,6 +4191,7 @@ export class DubbingApp {
 
     const startTime = performance.now();
     this.isTakePlayingRef = true;
+    const videoEl = document.getElementById('take-video');
 
     const animate = () => {
       if (!this.isTakePlayingRef) return;
@@ -4149,11 +4200,15 @@ export class DubbingApp {
 
       this.drawWaveform(canvas, refPeaks, ratio, null, existingTake?.peaks || null);
 
-      if (ratio >= 1.0 || (videoEl && videoEl.ended)) {
+      if (ratio >= 1.0 || elapsed >= duration) {
         this.stopTakePlayback();
+        const v = document.getElementById('take-video');
+        if (v) v.pause();
+        const ogv = document.getElementById('take-ogv-canvas');
+        if (ogv && typeof ogv.pause === 'function') ogv.pause();
         setTimeout(() => {
           this.drawWaveform(canvas, refPeaks, 0, null, existingTake?.peaks || null);
-        }, 200);
+        }, 150);
         return;
       }
       this.takeAnimFrameId = requestAnimationFrame(animate);
@@ -4227,15 +4282,16 @@ export class DubbingApp {
     await this.audio.startRecording();
 
     const startTime = performance.now();
+    const videoEl = document.getElementById('take-video');
 
     const animateRec = () => {
       if (!this.isTakeRecording) return;
       const recordingElapsed = (performance.now() - startTime) / 1000;
       const videoElapsed = videoEl && !videoEl.paused
         ? Math.max(0, videoEl.currentTime - (activeDiag.timestamp || 0))
-        : recordingElapsed + videoOffset;
+        : recordingElapsed;
 
-      const cursorRatio = Math.min(1.0, videoElapsed / phraseDuration);
+      const cursorRatio = Math.min(1.0, recordingElapsed / phraseDuration);
 
       // Read microphone amplitude
       const dataArray = new Uint8Array(128);
@@ -4250,7 +4306,7 @@ export class DubbingApp {
       this.drawWaveform(canvas, refPeaks, cursorRatio, this.liveMicLevelHistory, null);
 
       // Auto-finish recording the moment the phrase duration ends
-      if (cursorRatio >= 1.0 || videoElapsed >= phraseDuration || recordingElapsed >= phraseDuration) {
+      if (cursorRatio >= 1.0 || recordingElapsed >= phraseDuration) {
         this.finishTakeRecording(activeDiag);
         return;
       }
@@ -4614,9 +4670,10 @@ export class DubbingApp {
         if (this.isPlaying) this.onPlaybackFinished();
       };
       videoEl.onpause = () => {
-        // A browser-initiated pause must not leave the visual timeline running.
         if (this.isPlaying && !videoEl.ended) {
-          this.currentTime = videoEl.currentTime || this.currentTime;
+          if (videoEl.currentTime > 0) {
+            this.currentTime = videoEl.currentTime;
+          }
           this.isPlaying = false;
           if (this.animFrameId) cancelAnimationFrame(this.animFrameId);
           this.updateStudioUI(this.currentTime);
