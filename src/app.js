@@ -2692,53 +2692,57 @@ export class DubbingApp {
               </button>
             `}
 
-            <div style="margin-top: 1.25rem;">
-              <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.3rem;">Visualizador de Audio:</div>
-              <canvas id="waveform-canvas" class="waveform-canvas" width="300" height="60"></canvas>
-            </div>
+            ${!isListenMode ? `
+              <div style="margin-top: 1.25rem;">
+                <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.3rem;">Visualizador de Audio:</div>
+                <canvas id="waveform-canvas" class="waveform-canvas" width="300" height="60"></canvas>
+              </div>
+            ` : ''}
           </div>
 
-          <!-- Volume Controls -->
-          <div class="control-card">
-            <h3 class="control-card-title">🎚️ Mezclador de Audio</h3>
+          ${!isListenMode ? `
+            <!-- Volume Controls -->
+            <div class="control-card">
+              <h3 class="control-card-title">🎚️ Mezclador de Audio</h3>
 
-            <div class="vol-row">
-              <div class="vol-label">
-                <span>🎵 Música / Efectos de Fondo</span>
-                <span id="vol-backing-val">80%</span>
+              <div class="vol-row">
+                <div class="vol-label">
+                  <span>🎵 Música / Efectos de Fondo</span>
+                  <span id="vol-backing-val">80%</span>
+                </div>
+                <input type="range" id="vol-backing" class="vol-slider" min="0" max="1.5" step="0.05" value="0.8" />
               </div>
-              <input type="range" id="vol-backing" class="vol-slider" min="0" max="1.5" step="0.05" value="0.8" />
-            </div>
 
-            <div class="vol-row">
-              <div class="vol-label">
-                <span>🎙️ Tu Voz Grabada</span>
-                <span id="vol-voice-val">120%</span>
+              <div class="vol-row">
+                <div class="vol-label">
+                  <span>🎙️ Tu Voz Grabada</span>
+                  <span id="vol-voice-val">120%</span>
+                </div>
+                <input type="range" id="vol-voice" class="vol-slider" min="0" max="2.0" step="0.05" value="1.2" />
               </div>
-              <input type="range" id="vol-voice" class="vol-slider" min="0" max="2.0" step="0.05" value="1.2" />
-            </div>
 
-            <div class="vol-row">
-              <div class="vol-label">
-                <span>🗣️ Voces Originales (Otros)</span>
-                <span id="vol-orig-val">100%</span>
+              <div class="vol-row">
+                <div class="vol-label">
+                  <span>🗣️ Voces Originales (Otros)</span>
+                  <span id="vol-orig-val">100%</span>
+                </div>
+                <input type="range" id="vol-orig" class="vol-slider" min="0" max="1.5" step="0.05" value="1.0" />
               </div>
-              <input type="range" id="vol-orig" class="vol-slider" min="0" max="1.5" step="0.05" value="1.0" />
             </div>
-          </div>
 
-          <!-- Quick FX Selector -->
-          <div class="control-card">
-            <h3 class="control-card-title">🎛️ Filtro de Voz</h3>
-            <div class="fx-grid">
-              <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'clean' ? 'active' : ''}" data-fx="clean">✨ Normal</button>
-              <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'cartoon' ? 'active' : ''}" data-fx="cartoon">🐿️ Helio</button>
-              <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'villain' ? 'active' : ''}" data-fx="villain">😈 Grave</button>
-              <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'robot' ? 'active' : ''}" data-fx="robot">🤖 Robot</button>
-              <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'megaphone' ? 'active' : ''}" data-fx="megaphone">📢 Radio</button>
-              <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'reverb' ? 'active' : ''}" data-fx="reverb">🏟️ Eco</button>
+            <!-- Quick FX Selector -->
+            <div class="control-card">
+              <h3 class="control-card-title">🎛️ Filtro de Voz</h3>
+              <div class="fx-grid">
+                <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'clean' ? 'active' : ''}" data-fx="clean">✨ Normal</button>
+                <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'cartoon' ? 'active' : ''}" data-fx="cartoon">🐿️ Helio</button>
+                <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'villain' ? 'active' : ''}" data-fx="villain">😈 Grave</button>
+                <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'robot' ? 'active' : ''}" data-fx="robot">🤖 Robot</button>
+                <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'megaphone' ? 'active' : ''}" data-fx="megaphone">📢 Radio</button>
+                <button class="fx-pill studio-fx-pill ${this.selectedEffect === 'reverb' ? 'active' : ''}" data-fx="reverb">🏟️ Eco</button>
+              </div>
             </div>
-          </div>
+          ` : ''}
         </div>
       </div>
     `;
@@ -4837,13 +4841,16 @@ export class DubbingApp {
     this.isRecording = false;
     this.startWallTime = performance.now() - (this.currentTime * 1000);
 
-    // Start the backing track at the exact frame reported by the video.
-    if (this.backingAudioEl) {
-      this.backingAudioEl.currentTime = this.currentTime;
-      this.backingAudioEl.volume = Math.max(0, Math.min(1.0, this.audio.volumes.backing));
-      this.backingAudioEl.play().catch(e => console.warn('HTML5 backing audio notice:', e));
-    } else if (this.backingBuffer) {
-      this.audio.playBuffer(this.backingBuffer, 'backing', this.currentTime);
+    // In original playback mode, do NOT play the backing audio separately because the video track already contains the full mix!
+    // Backing track is only played during Dubbing Mode.
+    if (this.playbackMode === 'dubbing') {
+      if (this.backingAudioEl) {
+        this.backingAudioEl.currentTime = this.currentTime;
+        this.backingAudioEl.volume = Math.max(0, Math.min(1.0, this.audio.volumes.backing));
+        this.backingAudioEl.play().catch(e => console.warn('HTML5 backing audio notice:', e));
+      } else if (this.backingBuffer) {
+        this.audio.playBuffer(this.backingBuffer, 'backing', this.currentTime);
+      }
     }
 
     this.startMasterClockLoop();
@@ -5023,17 +5030,16 @@ export class DubbingApp {
 
       this.updateStudioUI(this.currentTime);
 
-      // Check dialogue audio triggers
-      const dialogues = this.selectedScene?.dialogues || [];
-      for (const d of dialogues) {
-        if (this.currentTime >= d.timestamp && !this.playedDialogueIds.has(d.id)) {
-          this.playedDialogueIds.add(d.id);
+      // Check dialogue audio triggers ONLY in dubbing mode (in original mode, the video itself plays the complete audio!)
+      const isOriginalMode = this.playbackMode === 'original';
+      if (!isOriginalMode) {
+        const dialogues = this.selectedScene?.dialogues || [];
+        for (const d of dialogues) {
+          if (this.currentTime >= d.timestamp && !this.playedDialogueIds.has(d.id)) {
+            this.playedDialogueIds.add(d.id);
 
-          const isOriginalMode = this.playbackMode === 'original';
-          const isUserTurn = !isOriginalMode && this.isCharacterDubbedByUser(d.character);
-
-          if (isOriginalMode || !isUserTurn) {
-            if (d.audioEl) {
+            const isUserTurn = this.isCharacterDubbedByUser(d.character);
+            if (!isUserTurn && d.audioEl) {
               d.audioEl.currentTime = 0;
               d.audioEl.volume = Math.max(0, Math.min(1.0, this.audio.volumes.original));
               d.audioEl.play().catch(e => console.log('Dialogue audio notice:', e));
