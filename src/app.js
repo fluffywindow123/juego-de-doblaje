@@ -1146,42 +1146,72 @@ export class DubbingApp {
       }
     }
 
-    // Play video — ensure source is loaded and ready
+    // Play video — ensure source is loaded and ready with OGVPlayer support for macOS/Safari
     const videoEl = document.getElementById('play-dub-video');
     if (videoEl) {
       videoEl.muted = true;
       const sceneForVideo = sceneSnapshot;
       const vUrl = this.getVideoUrl(sceneForVideo);
-      if (vUrl && videoEl.src !== vUrl) {
-        videoEl.src = vUrl;
-        videoEl.load();
-      }
+      const isOgv = (sceneForVideo?.videoKey || '').toLowerCase().endsWith('.ogv');
+      const canPlayType = videoEl.canPlayType('video/ogg; codecs="theora"');
 
-      // Wait for video data if needed
-      if (videoEl.readyState < 2 && vUrl) {
-        await new Promise((resolve) => {
-          const onReady = () => {
-            videoEl.removeEventListener('canplay', onReady);
-            videoEl.removeEventListener('loadeddata', onReady);
-            clearTimeout(timeout);
-            resolve();
-          };
-          videoEl.addEventListener('canplay', onReady, { once: true });
-          videoEl.addEventListener('loadeddata', onReady, { once: true });
-          const timeout = setTimeout(() => {
-            videoEl.removeEventListener('canplay', onReady);
-            videoEl.removeEventListener('loadeddata', onReady);
-            resolve();
-          }, 4000);
-        });
-      }
+      // If browser can't decode OGV natively and OGVPlayer (WebAssembly decoder) is loaded:
+      if (isOgv && (!canPlayType || canPlayType === '') && typeof window.OGVPlayer !== 'undefined' && vUrl) {
+        if (!videoEl._ogvPlayer) {
+          try {
+            const player = new window.OGVPlayer();
+            player.muted = true;
+            player.src = vUrl;
+            player.style.width = '100%';
+            player.style.height = '100%';
+            player.style.objectFit = 'contain';
+            player.style.position = 'absolute';
+            player.style.top = '0';
+            player.style.left = '0';
+            player.id = 'play-dub-ogv-canvas';
+            videoEl.parentNode.appendChild(player);
+            videoEl._ogvPlayer = player;
+            videoEl.style.opacity = '0';
+          } catch (ogvErr) {
+            console.warn('[OGVPlayer PlayDub] Init error:', ogvErr);
+          }
+        }
+        if (videoEl._ogvPlayer) {
+          try { videoEl._ogvPlayer.currentTime = this.currentTime; } catch {}
+          try { await videoEl._ogvPlayer.play(); } catch {}
+        }
+      } else {
+        if (vUrl && videoEl.src !== vUrl) {
+          videoEl.src = vUrl;
+          videoEl.load();
+        }
 
-      videoEl.currentTime = this.currentTime;
-      videoEl.removeAttribute('poster');
-      try {
-        await videoEl.play();
-      } catch (e) {
-        console.warn('[startPlayDubLoop] Video play warning:', e);
+        // Wait for video data if needed
+        if (videoEl.readyState < 2 && vUrl) {
+          await new Promise((resolve) => {
+            const onReady = () => {
+              videoEl.removeEventListener('canplay', onReady);
+              videoEl.removeEventListener('loadeddata', onReady);
+              clearTimeout(timeout);
+              resolve();
+            };
+            videoEl.addEventListener('canplay', onReady, { once: true });
+            videoEl.addEventListener('loadeddata', onReady, { once: true });
+            const timeout = setTimeout(() => {
+              videoEl.removeEventListener('canplay', onReady);
+              videoEl.removeEventListener('loadeddata', onReady);
+              resolve();
+            }, 3000);
+          });
+        }
+
+        videoEl.currentTime = this.currentTime;
+        videoEl.removeAttribute('poster');
+        try {
+          await videoEl.play();
+        } catch (e) {
+          console.warn('[startPlayDubLoop] Video play warning:', e);
+        }
       }
     }
 
@@ -1257,7 +1287,16 @@ export class DubbingApp {
     if (this.animFrameId) cancelAnimationFrame(this.animFrameId);
 
     const videoEl = document.getElementById('play-dub-video');
-    if (videoEl) videoEl.pause();
+    if (videoEl) {
+      if (videoEl._ogvPlayer && typeof videoEl._ogvPlayer.pause === 'function') {
+        try { videoEl._ogvPlayer.pause(); } catch {}
+      }
+      try { videoEl.pause(); } catch {}
+    }
+    const ogvCanvas = document.getElementById('play-dub-ogv-canvas');
+    if (ogvCanvas && typeof ogvCanvas.pause === 'function') {
+      try { ogvCanvas.pause(); } catch {}
+    }
 
     if (this.backingAudioEl) this.backingAudioEl.pause();
 
