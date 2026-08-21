@@ -1427,8 +1427,8 @@ export class DubbingApp {
         <!-- Bulk Selection Action Bar -->
         <div style="display:flex; gap:0.75rem; align-items:center;">
           ${selectedCount > 0 ? `
-            <button class="btn-cyan" id="btn-download-selected" style="background:linear-gradient(135deg, var(--neon-green), #00a852); color:#000; font-weight:900; padding:0.75rem 1.4rem; box-shadow: 0 0 20px rgba(0,255,136,0.5);">
-              📥 Descargar Seleccionadas (${selectedCount})
+            <button class="btn-cyan" id="btn-download-selected" style="background:linear-gradient(135deg, var(--neon-green), #00a852); color:#000; font-weight:900; padding:0.75rem 1.4rem; box-shadow: 0 0 20px rgba(0,255,136,0.5);" title="Abrir descargas de Chrome para todas las escenas seleccionadas">
+              ⬇️ Descargar (${selectedCount}) en Chrome
             </button>
             <button class="btn-secondary" id="btn-clear-selection" style="padding:0.75rem 1rem;">
               Desmarcar
@@ -1522,25 +1522,16 @@ export class DubbingApp {
               <button class="btn-card-play" style="width:100%; background:rgba(0,255,136,0.15); border:1px solid var(--neon-green); color:var(--neon-green); cursor:default;">
                 ✓ Ya en tu Biblioteca
               </button>
-            ` : (queueItem ? `
-              <button class="btn-card-play" style="width:100%; background:rgba(234,179,8,0.2); border:1px solid #eab308; color:#fff; cursor:default;">
-                ${queueItem.status === 'completed' ? '✅ Descargada' : `⏳ ${queueItem.status === 'downloading' ? `${queueItem.percent}%` : 'En cola'}`}
-              </button>
             ` : `
-              <div style="display:flex; gap:0.4rem; flex-direction:column;">
-                <div style="display:flex; gap:0.4rem;">
-                  <button class="btn-card-play btn-download-single-mod" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" style="flex:1; background: linear-gradient(135deg, var(--neon-cyan), #0088ff); color: #000; font-weight:800;" title="Descargar e instalar automáticamente">
-                    📥 Descargar
-                  </button>
-                  <a href="${mod.profileUrl}#FileInfo_1" target="_blank" class="btn-icon-action" style="text-decoration:none; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.08); border:1px solid var(--border-glass); border-radius:var(--radius-md); padding:0 0.6rem; color:#fff;" title="Descarga directa a tu Mac (GameBanana Oficial)">
-                    ⚡
-                  </a>
-                  <button class="btn-icon-action btn-add-queue" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" title="Añadir a cola">
-                    ➕
-                  </button>
-                </div>
+              <div style="display:flex; gap:0.4rem;">
+                <a href="${mod.profileUrl}#FileInfo_1" target="_blank" class="btn-card-play" style="text-decoration:none; display:flex; align-items:center; justify-content:center; flex:1; background: linear-gradient(135deg, var(--neon-cyan), #0088ff); color: #000; font-weight:800; padding:0.6rem 0.8rem; font-size:0.9rem;" title="Descargar archivo ZIP directamente a las descargas de Chrome">
+                  ⬇️ Descargar ZIP (Chrome)
+                </a>
+                <button class="btn-icon-action btn-add-queue" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" title="Procesar automáticamente">
+                  📥
+                </button>
               </div>
-            `)}
+            `}
           </div>
         </div>
       </div>
@@ -1908,12 +1899,12 @@ export class DubbingApp {
 
     for (const modId of ids) {
       const mod = this.onlineScenes.find(m => m.id === modId);
-      const title = mod ? mod.title : `Mod #${modId}`;
-      this.queueModDownload(modId, title);
+      const url = mod?.profileUrl ? `${mod.profileUrl}#FileInfo_1` : `https://gamebanana.com/mods/${modId}#FileInfo_1`;
+      window.open(url, '_blank');
     }
 
     this.selectedModIds.clear();
-    this.showToast(`¡${ids.length} escenas añadidas a la cola de descargas!`, 'success');
+    this.showToast(`¡Abriendo descargas de Chrome para ${ids.length} escenas! Al descargarse, arrastra los ZIP a "Importar ZIP".`, 'success');
     this.render();
   }
 
