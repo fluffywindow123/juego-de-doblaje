@@ -1926,10 +1926,14 @@ export class DubbingApp {
   }
 
   async fetchModItemData(modId) {
+    const targetUrl = `https://api.gamebanana.com/Core/Item/Data?itemtype=Mod&itemid=${modId}&fields=name,Files().aFiles()`;
     const endpoints = [
-      `https://api.gamebanana.com/Core/Item/Data?itemtype=Mod&itemid=${modId}&fields=name,Files().aFiles()`,
-      `https://cors.eu.org/https://api.gamebanana.com/Core/Item/Data?itemtype=Mod&itemid=${modId}&fields=name,Files().aFiles()`,
-      `https://proxy.cors.sh/https://api.gamebanana.com/Core/Item/Data?itemtype=Mod&itemid=${modId}&fields=name,Files().aFiles()`
+      `/api/gamebanana/mod?id=${modId}`,
+      targetUrl,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+      `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
+      `https://cors.eu.org/${targetUrl}`
     ];
 
     for (const ep of endpoints) {
@@ -1937,7 +1941,7 @@ export class DubbingApp {
         const res = await fetch(ep);
         if (res.ok) {
           const data = await res.json();
-          if (data && data[1]) return data;
+          if (data && (data[1] || data[0])) return data;
         }
       } catch (e) {}
     }
@@ -1947,8 +1951,10 @@ export class DubbingApp {
   async fetchGameBananaFile(downloadUrl, queueItem) {
     const candidates = [
       `/api/gamebanana/download?modId=${queueItem.id}`,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(downloadUrl)}`,
+      `https://corsproxy.io/?${encodeURIComponent(downloadUrl)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(downloadUrl)}`,
       `https://cors.eu.org/${downloadUrl}`,
-      `https://proxy.cors.sh/${downloadUrl}`,
       downloadUrl
     ];
 
