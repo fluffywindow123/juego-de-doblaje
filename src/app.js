@@ -3903,8 +3903,40 @@ export class DubbingApp {
         return { videoEl: null, offset: 0 };
       }
 
-      // Always re-assign src to ensure fresh blob URL is used
-      // (IndexedDB data may have changed since last load)
+      // Check if browser can play this video MIME directly (macOS/Safari cannot decode OGV natively)
+      const isOgv = (this.selectedScene?.videoKey || '').toLowerCase().endsWith('.ogv');
+      const canPlayType = videoEl.canPlayType('video/ogg; codecs="theora"');
+
+      // If browser can't decode OGV natively and OGVPlayer (WebAssembly decoder) is loaded:
+      if (isOgv && (!canPlayType || canPlayType === '') && typeof window.OGVPlayer !== 'undefined') {
+        if (!videoEl._ogvPlayer) {
+          try {
+            const player = new window.OGVPlayer();
+            player.muted = true;
+            player.src = vUrl;
+            player.style.width = '100%';
+            player.style.height = '100%';
+            player.style.objectFit = 'contain';
+            player.style.position = 'absolute';
+            player.style.top = '0';
+            player.style.left = '0';
+            player.id = 'take-ogv-canvas';
+            videoEl.parentNode.appendChild(player);
+            videoEl._ogvPlayer = player;
+            videoEl.style.opacity = '0';
+          } catch (ogvErr) {
+            console.warn('[OGVPlayer] Init error, falling back to standard video:', ogvErr);
+          }
+        }
+        if (videoEl._ogvPlayer) {
+          const targetTime = Math.max(0, startTime || 0);
+          try { videoEl._ogvPlayer.currentTime = targetTime; } catch {}
+          try { await videoEl._ogvPlayer.play(); } catch {}
+          return { videoEl: videoEl._ogvPlayer, offset: 0 };
+        }
+      }
+
+      // Standard HTML5 video playback
       if (videoEl.src !== vUrl) {
         videoEl.src = vUrl;
         videoEl.load();
@@ -3923,13 +3955,11 @@ export class DubbingApp {
           };
           videoEl.addEventListener('canplay', onReady, { once: true });
           videoEl.addEventListener('loadeddata', onReady, { once: true });
-          // Timeout after 4 seconds so we don't hang forever
           const timeout = setTimeout(() => {
             videoEl.removeEventListener('canplay', onReady);
             videoEl.removeEventListener('loadeddata', onReady);
-            console.warn('[startTakeVideoSegment] Video load timeout, proceeding anyway');
             resolve();
-          }, 4000);
+          }, 3000);
         });
       }
 
@@ -4652,14 +4682,48 @@ export class DubbingApp {
 
     try {
       videoEl.muted = true;
+      const vUrl = this.getVideoUrl(this.selectedScene);
+
+      // Check if browser can play this video MIME directly (macOS/Safari cannot decode OGV natively)
+      const isOgv = (this.selectedScene?.videoKey || '').toLowerCase().endsWith('.ogv');
+      const canPlayType = videoEl.canPlayType('video/ogg; codecs="theora"');
+
+      // If browser can't decode OGV natively and OGVPlayer (WebAssembly decoder) is loaded:
+      if (isOgv && (!canPlayType || canPlayType === '') && typeof window.OGVPlayer !== 'undefined' && vUrl) {
+        if (!videoEl._ogvPlayer) {
+          try {
+            const player = new window.OGVPlayer();
+            player.muted = true;
+            player.src = vUrl;
+            player.style.width = '100%';
+            player.style.height = '100%';
+            player.style.objectFit = 'contain';
+            player.style.position = 'absolute';
+            player.style.top = '0';
+            player.style.left = '0';
+            player.id = 'studio-ogv-canvas';
+            videoEl.parentNode.appendChild(player);
+            videoEl._ogvPlayer = player;
+            videoEl.style.opacity = '0';
+          } catch (ogvErr) {
+            console.warn('[OGVPlayer Studio] Init error:', ogvErr);
+          }
+        }
+        if (videoEl._ogvPlayer) {
+          try { videoEl._ogvPlayer.currentTime = this.currentTime; } catch {}
+          try { await videoEl._ogvPlayer.play(); } catch {}
+          return true;
+        }
+      }
+
       if (!videoEl.src || videoEl.src === window.location.href) {
-        const vUrl = this.getVideoUrl(this.selectedScene);
         if (vUrl) videoEl.src = vUrl;
       }
       const maxTime = Number.isFinite(videoEl.duration) && videoEl.duration > 0
         ? Math.max(0, videoEl.duration - 0.01)
         : Math.max(0, this.currentTime);
       videoEl.currentTime = Math.min(Math.max(0, this.currentTime), maxTime);
+      videoEl.removeAttribute('poster');
       await videoEl.play();
       this.currentTime = videoEl.currentTime || this.currentTime;
       return true;
