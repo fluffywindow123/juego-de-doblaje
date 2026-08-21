@@ -4671,12 +4671,7 @@ export class DubbingApp {
       };
       videoEl.onpause = () => {
         if (this.isPlaying && !videoEl.ended) {
-          if (videoEl.currentTime > 0) {
-            this.currentTime = videoEl.currentTime;
-          }
-          this.isPlaying = false;
-          if (this.animFrameId) cancelAnimationFrame(this.animFrameId);
-          this.updateStudioUI(this.currentTime);
+          this.pauseStudioPlayback();
         }
       };
 
@@ -5007,47 +5002,29 @@ export class DubbingApp {
       if (!this.isPlaying) return;
 
       const videoEl = document.getElementById('studio-video');
-      if (videoEl) {
-        if (Number.isFinite(videoEl.duration) && videoEl.duration > 0 && videoEl.duration !== this.duration) {
-          this.setStudioDuration(videoEl.duration);
-        }
+      const ogvPlayer = videoEl?._ogvPlayer;
 
-        if (videoEl.ended) {
-          this.currentTime = videoEl.duration || this.currentTime;
-          this.updateStudioUI(this.currentTime);
-          this.onPlaybackFinished();
-          return;
-        }
-
-        if (videoEl.paused) {
-          this.currentTime = videoEl.currentTime || this.currentTime;
-          this.isPlaying = false;
-          this.updateStudioUI(this.currentTime);
-          return;
-        }
-
-        // The video frame is the source of truth for subtitles, dialogue cues
-        // and progress. Do not derive it from wall-clock time.
-        this.currentTime = Math.max(0, videoEl.currentTime || 0);
-
-        // Keep the package backing track aligned if a browser briefly drifts.
-        if (this.backingAudioEl && !this.backingAudioEl.paused && Math.abs(this.backingAudioEl.currentTime - this.currentTime) > 0.12) {
-          this.backingAudioEl.currentTime = this.currentTime;
-        }
+      if (ogvPlayer && !ogvPlayer.paused) {
+        // OGV Player clock source
+        this.currentTime = Math.max(0, ogvPlayer.currentTime || (performance.now() - this.startWallTime) / 1000);
+      } else if (videoEl && !videoEl.paused) {
+        // Native video clock source
+        this.currentTime = Math.max(0, videoEl.currentTime || (performance.now() - this.startWallTime) / 1000);
       } else {
-        // Audio-only packages retain a wall-clock fallback.
+        // Continuous wall-clock fallback
         const elapsedSec = (performance.now() - this.startWallTime) / 1000;
         this.currentTime = Math.max(0, elapsedSec);
-        if (this.currentTime >= this.duration) {
-          this.onPlaybackFinished();
-          return;
-        }
+      }
+
+      if (this.duration > 0 && this.currentTime >= this.duration) {
+        this.onPlaybackFinished();
+        return;
       }
 
       this.updateStudioUI(this.currentTime);
 
       // Check dialogue audio triggers
-      const dialogues = this.selectedScene.dialogues || [];
+      const dialogues = this.selectedScene?.dialogues || [];
       for (const d of dialogues) {
         if (this.currentTime >= d.timestamp && !this.playedDialogueIds.has(d.id)) {
           this.playedDialogueIds.add(d.id);
