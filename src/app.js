@@ -1527,13 +1527,18 @@ export class DubbingApp {
                 ${queueItem.status === 'completed' ? '✅ Descargada' : `⏳ ${queueItem.status === 'downloading' ? `${queueItem.percent}%` : 'En cola'}`}
               </button>
             ` : `
-              <div style="display:flex; gap:0.4rem;">
-                <button class="btn-card-play btn-download-single-mod" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" style="flex:1; background: linear-gradient(135deg, var(--neon-cyan), #0088ff); color: #000; font-weight:800;">
-                  📥 Descargar
-                </button>
-                <button class="btn-icon-action btn-add-queue" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" title="Añadir a cola de descargas">
-                  ➕
-                </button>
+              <div style="display:flex; gap:0.4rem; flex-direction:column;">
+                <div style="display:flex; gap:0.4rem;">
+                  <button class="btn-card-play btn-download-single-mod" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" style="flex:1; background: linear-gradient(135deg, var(--neon-cyan), #0088ff); color: #000; font-weight:800;" title="Descargar e instalar automáticamente">
+                    📥 Descargar
+                  </button>
+                  <a href="${mod.profileUrl}#FileInfo_1" target="_blank" class="btn-icon-action" style="text-decoration:none; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.08); border:1px solid var(--border-glass); border-radius:var(--radius-md); padding:0 0.6rem; color:#fff;" title="Descarga directa a tu Mac (GameBanana Oficial)">
+                    ⚡
+                  </a>
+                  <button class="btn-icon-action btn-add-queue" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" title="Añadir a cola">
+                    ➕
+                  </button>
+                </div>
               </div>
             `)}
           </div>
@@ -5207,9 +5212,9 @@ export class DubbingApp {
 
             <div id="dropzone" class="dropzone">
               <div class="dropzone-icon">📦</div>
-              <h3 style="font-size: 1.15rem; font-weight: 800;">Arrastra tu archivo ZIP o RAR aquí</h3>
-              <p style="font-size: 0.85rem; color: var(--text-muted);">o haz clic para explorar tu dispositivo (.zip, .rar, .7z)</p>
-              <input type="file" id="zip-file-input" accept=".zip,.rar,.7z,.tar" style="display: none;" />
+              <h3 style="font-size: 1.15rem; font-weight: 800;">Arrastra tus archivos ZIP o RAR aquí</h3>
+              <p style="font-size: 0.85rem; color: var(--text-muted);">o haz clic para explorar (.zip, .rar, .7z — individual o múltiples escenas agrupadas)</p>
+              <input type="file" id="zip-file-input" accept=".zip,.rar,.7z,.tar" multiple style="display: none;" />
             </div>
 
             <div id="validation-report" style="display: none;" class="validation-box">
@@ -5219,7 +5224,7 @@ export class DubbingApp {
 
             <div id="import-success-box" style="display: none; background: rgba(0, 255, 136, 0.1); border: 1px solid var(--neon-green); border-radius: var(--radius-md); padding: 1rem; text-align: center;">
               <div style="font-size: 2rem; margin-bottom: 0.25rem;">✅</div>
-              <h4 style="color: var(--neon-green); font-size: 1.1rem; font-weight: 800;">¡Escena Importada con Éxito!</h4>
+              <h4 style="color: var(--neon-green); font-size: 1.1rem; font-weight: 800;">¡Escenas Importadas con Éxito!</h4>
               <p id="import-success-details" style="font-size: 0.85rem; color: #fff; margin-top: 0.4rem;"></p>
             </div>
           </div>
@@ -5248,14 +5253,18 @@ export class DubbingApp {
       dropzone.ondrop = async (e) => {
         e.preventDefault();
         dropzone.classList.remove('dragover');
-        if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-          await this.processZipFile(e.dataTransfer.files[0]);
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          for (let i = 0; i < e.dataTransfer.files.length; i++) {
+            await this.processZipFile(e.dataTransfer.files[i]);
+          }
         }
       };
 
       fileInput.onchange = async (e) => {
-        if (e.target.files && e.target.files[0]) {
-          await this.processZipFile(e.target.files[0]);
+        if (e.target.files && e.target.files.length > 0) {
+          for (let i = 0; i < e.target.files.length; i++) {
+            await this.processZipFile(e.target.files[i]);
+          }
         }
       };
     }
@@ -5326,52 +5335,64 @@ export class DubbingApp {
         } catch (e) {}
       }
 
-      const parsed = ZipEngine.parseScenePackage(unzipped);
-      const validation = ZipEngine.validateScene(parsed);
-
+      const parsedScenes = ZipEngine.parseAllScenes(unzipped);
+      let importedCount = 0;
       let reportHtml = '';
-      reportHtml += `<div class="val-item"><span class="val-icon success">✓</span> Metadatos de escena: <strong>${parsed.meta.title}</strong></div>`;
-      reportHtml += `<div class="val-item"><span class="val-icon ${validation.checks.hasVideo ? 'success' : 'error'}">${validation.checks.hasVideo ? '✓' : '✗'}</span> Video/Animación: ${parsed.videoKey ? parsed.videoKey.split('/').pop() : 'No encontrado'}</div>`;
-      reportHtml += `<div class="val-item"><span class="val-icon ${validation.checks.hasBackingTrack ? 'success' : 'warning'}">${validation.checks.hasBackingTrack ? '✓' : '⚠️'}</span> Pista de fondo: ${parsed.backingTrackKey ? parsed.backingTrackKey.split('/').pop() : 'Ausente'}</div>`;
-      reportHtml += `<div class="val-item"><span class="val-icon ${validation.checks.hasDialogues ? 'success' : 'error'}">${validation.checks.hasDialogues ? '✓' : '✗'}</span> Diálogos sincronizados: <strong>${parsed.dialogues.length} líneas</strong></div>`;
-      reportHtml += `<div class="val-item"><span class="val-icon success">✓</span> Personajes: <strong>${parsed.meta.characters.join(', ')}</strong></div>`;
+
+      for (let idx = 0; idx < parsedScenes.length; idx++) {
+        const parsed = parsedScenes[idx];
+        const validation = ZipEngine.validateScene(parsed);
+
+        reportHtml += `<div class="val-item" style="border-bottom: 1px solid var(--border-glass); padding-bottom: 0.5rem; margin-bottom: 0.5rem;">`;
+        reportHtml += `<div><span class="val-icon success">✓</span> Escena ${idx + 1}/${parsedScenes.length}: <strong>${parsed.meta.title}</strong></div>`;
+        reportHtml += `<div style="font-size:0.8rem; color:var(--text-muted); margin-left:1.5rem;">`;
+        reportHtml += `🎬 Video: ${parsed.videoKey ? parsed.videoKey.split('/').pop() : 'No encontrado'} | `;
+        reportHtml += `💬 Diálogos: ${parsed.dialogues.length} líneas | `;
+        reportHtml += `🎭 Personajes: ${parsed.meta.characters.join(', ')}`;
+        reportHtml += `</div></div>`;
+
+        if (validation.isValid) {
+          await GameDB.saveScene({
+            title: parsed.meta.title,
+            authors: parsed.meta.authors,
+            readme: parsed.meta.readme,
+            characters: parsed.meta.characters,
+            duration: parsed.meta.estimatedDuration,
+            dialogues: parsed.dialogues,
+            prefix: parsed.prefix,
+            videoKey: parsed.videoKey,
+            backingTrackKey: parsed.backingTrackKey,
+            iconName: parsed.meta.iconName,
+            imageFiles: parsed.imageFiles,
+            rawFiles: parsed.rawFiles,
+            importDate: new Date().toISOString()
+          });
+          importedCount++;
+        }
+      }
 
       if (listEl) listEl.innerHTML = reportHtml;
 
-      if (validation.isValid) {
-        await GameDB.saveScene({
-          title: parsed.meta.title,
-          authors: parsed.meta.authors,
-          readme: parsed.meta.readme,
-          characters: parsed.meta.characters,
-          duration: parsed.meta.estimatedDuration,
-          dialogues: parsed.dialogues,
-          prefix: parsed.prefix,
-          videoKey: parsed.videoKey,
-          backingTrackKey: parsed.backingTrackKey,
-          iconName: parsed.meta.iconName,
-          imageFiles: parsed.imageFiles,
-          rawFiles: parsed.rawFiles,
-          importDate: new Date().toISOString()
-        });
-
+      if (importedCount > 0) {
         this.scenes = await GameDB.getAllScenes();
         SFX.playSuccess();
 
         if (successBox && successDetails) {
           successBox.style.display = 'block';
-          successDetails.textContent = `"${parsed.meta.title}" ya está disponible en tu colección.`;
+          successDetails.textContent = importedCount === 1
+            ? `"${parsedScenes[0].meta.title}" ya está disponible en tu colección.`
+            : `¡${importedCount} escenas agrupadas importadas con éxito a tu biblioteca!`;
         }
 
         setTimeout(() => {
           const root = document.getElementById('modal-root');
           if (root) root.innerHTML = '';
           this.navigate('library');
-          this.showToast(`¡Escena "${parsed.meta.title}" guardada!`, 'success');
+          this.showToast(importedCount === 1 ? `¡Escena "${parsedScenes[0].meta.title}" guardada!` : `¡${importedCount} escenas guardadas con éxito!`, 'success');
         }, 1400);
       } else {
         SFX.playError();
-        this.showToast('El archivo ZIP tiene errores y no pudo importarse.', 'error');
+        this.showToast('El archivo ZIP no contiene escenas válidas.', 'error');
       }
     } catch (err) {
       console.error('Error importando ZIP:', err);

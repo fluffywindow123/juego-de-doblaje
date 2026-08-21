@@ -101,6 +101,76 @@ export class ZipEngine {
   }
 
   /**
+   * Automatically detect if a ZIP contains multiple scenes (e.g. "Película 1/", "Película 2/" subfolders)
+   * or a single scene, and parse each scene independently.
+   * @param {Record<string, Uint8Array>} files
+   * @returns {Array<any>} Array of parsed scene objects
+   */
+  static parseAllScenes(files) {
+    const fileKeys = Object.keys(files);
+    if (fileKeys.length === 0) {
+      throw new Error("El archivo ZIP está vacío.");
+    }
+
+    // Check if there are multiple subfolders containing dialogue files or pack_info
+    const topFolders = new Set();
+    for (const key of fileKeys) {
+      const parts = key.split('/');
+      if (parts.length > 1 && parts[0].trim().length > 0) {
+        topFolders.add(parts[0]);
+      }
+    }
+
+    // Check how many subfolders look like complete standalone scenes
+    const sceneFolders = [];
+    for (const folder of topFolders) {
+      const folderPrefix = folder + '/';
+      const folderFiles = fileKeys.filter(k => k.startsWith(folderPrefix));
+      const hasDialogues = folderFiles.some(k => {
+        const lower = k.toLowerCase();
+        return (lower.endsWith('.txt') || lower.endsWith('.ini')) && !lower.endsWith('pack_info.ini') && !lower.endsWith('info.ini') && !lower.endsWith('readme.txt');
+      });
+      const hasAudioOrVideo = folderFiles.some(k => {
+        const lower = k.toLowerCase();
+        return lower.endsWith('.mp4') || lower.endsWith('.webm') || lower.endsWith('.ogv') || lower.endsWith('.mp3') || lower.endsWith('.ogg') || lower.endsWith('.wav');
+      });
+
+      if (hasDialogues && hasAudioOrVideo) {
+        sceneFolders.push(folder);
+      }
+    }
+
+    // If multiple distinct scenes are found in subfolders, parse each one separately!
+    if (sceneFolders.length > 1) {
+      const parsedScenes = [];
+      for (const folder of sceneFolders) {
+        const folderPrefix = folder + '/';
+        const subsetFiles = {};
+        for (const key of fileKeys) {
+          if (key.startsWith(folderPrefix)) {
+            subsetFiles[key] = files[key];
+          }
+        }
+        try {
+          const parsed = this.parseScenePackage(subsetFiles);
+          if (!parsed.meta.title || parsed.meta.title === 'Escena de Doblaje') {
+            parsed.meta.title = folder;
+          }
+          parsedScenes.push(parsed);
+        } catch (err) {
+          console.warn(`Could not parse sub-scene in folder "${folder}":`, err);
+        }
+      }
+      if (parsedScenes.length > 0) {
+        return parsedScenes;
+      }
+    }
+
+    // Default: Single scene package
+    return [this.parseScenePackage(files)];
+  }
+
+  /**
    * Parse scene metadata and files from unzipped files map (Supports all GameBanana mod formats)
    * @param {Record<string, Uint8Array>} files 
    */
