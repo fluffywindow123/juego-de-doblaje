@@ -1108,11 +1108,24 @@ export class DubbingApp {
 
     console.log(`[setupPlayDub] Decoded ${this.playDubUserBuffers.size} of ${takes.length} user takes`);
 
-    // 2. Prepare backing audio
+    // 2. Prepare backing audio (both HTML5 Audio and Web Audio buffer for rock-solid playback)
+    this.backingBuffer = null;
+    this.backingAudioEl = null;
+
     const backingUrl = this.getBackingAudioUrl(sceneSnapshot);
     if (backingUrl) {
       this.backingAudioEl = new Audio(backingUrl);
       this.backingAudioEl.preload = 'auto';
+    }
+
+    const rawFiles = sceneSnapshot.rawFiles || {};
+    const backingKey = sceneSnapshot.backingTrackKey || Object.keys(rawFiles).find(k => k.toLowerCase().includes('backing') || k.toLowerCase().includes('background') || k.toLowerCase().includes('music'));
+    if (backingKey && rawFiles[backingKey]) {
+      try {
+        this.backingBuffer = await this.audio.decodeAudio(rawFiles[backingKey], `backing_${sceneSnapshot.id}`);
+      } catch (e) {
+        console.warn('[setupPlayDub] Backing decode error:', e);
+      }
     }
 
     // 3. Prepare other dialogue original audios (only for dialogues that were NOT dubbed by the user)
@@ -1215,11 +1228,13 @@ export class DubbingApp {
       }
     }
 
-    // Play backing track
+    // Play backing track (WAV, MP3 or OGG)
     if (this.backingAudioEl) {
       this.backingAudioEl.currentTime = this.currentTime;
-      this.backingAudioEl.volume = Math.max(0, Math.min(1.0, this.audio.volumes.backing));
-      this.backingAudioEl.play().catch(() => {});
+      this.backingAudioEl.volume = Math.max(0, Math.min(1.0, this.audio.volumes.backing || 0.8));
+      this.backingAudioEl.play().catch(e => console.warn('[startPlayDubLoop] HTML5 backing error:', e));
+    } else if (this.backingBuffer) {
+      this.audio.playBuffer(this.backingBuffer, 'backing', this.currentTime);
     }
 
     const btnToggle = document.getElementById('btn-play-dub-toggle');
