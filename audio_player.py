@@ -39,6 +39,9 @@ class AudioPlayer:
 
         self.custom_recordings = {} # dialogue_id -> recorded_audio_path
         self.user_recorded_file = None
+        # Scene folder + dubbed role the last full-scene take was recorded for
+        self.user_recorded_scene = None
+        self.user_recorded_role = None
         self.record_frames = []
         self.record_stream = None
 
@@ -61,7 +64,8 @@ class AudioPlayer:
         if PYGAME_AVAILABLE:
             try:
                 if not pygame.mixer.get_init():
-                    pygame.mixer.init(frequency=44100, size=-16, channels=8, buffer=1024)
+                    # channels = output speaker channels (stereo); simultaneous sounds are set below
+                    pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
                 pygame.mixer.set_num_channels(16)
             except Exception as e:
                 print(f"Mixer init error: {e}")
@@ -89,7 +93,10 @@ class AudioPlayer:
               "dubbed_preview" (plays backing + other characters + player recorded voice)
         """
         self.stop()
-        self.stop_event.clear()
+        # Each playback gets its own stop event, so a previous loop that is still
+        # winding down can never act on (or stop) this new playback.
+        stop_event = threading.Event()
+        self.stop_event = stop_event
         self.played_dialogue_ids.clear()
         self.is_playing = True
         self.is_paused = False
@@ -97,29 +104,47 @@ class AudioPlayer:
 
         self.playback_thread = threading.Thread(
             target=self._playback_loop,
-            args=(mode, dubbed_character, on_update_callback, on_finish_callback),
+            args=(mode, dubbed_character, on_update_callback, on_finish_callback, stop_event),
             daemon=True
         )
         self.playback_thread.start()
 
-    def _playback_loop(self, mode, dubbed_character, on_update, on_finish):
+    def _has_take_for(self, dubbed_character):
+        return bool(
+            self.user_recorded_file
+            and os.path.exists(self.user_recorded_file)
+            and self.user_recorded_scene == self.scene_folder
+            and (self.user_recorded_role or "").lower() == (dubbed_character or "").lower()
+        )
+
+    def _playback_loop(self, mode, dubbed_character, on_update, on_finish, stop_event):
+        dubbed_character = dubbed_character or "None"
+
+        # Open the mic BEFORE starting the music: opening the input stream can take a
+        # moment, and the scene clock must start together with the backing track.
+        if mode == "dubbing":
+            self.start_mic_recording()
+            self.user_recorded_scene = self.scene_folder
+            self.user_recorded_role = dubbed_character
+
+        # In preview mode the user's take is one continuous recording that started at t=0
+        play_user_take = mode == "dubbed_preview" and self._has_take_for(dubbed_character)
+
         # 1. Start backing track
         if self.backing_track_path and os.path.exists(self.backing_track_path) and PYGAME_AVAILABLE:
             try:
                 pygame.mixer.music.load(self.backing_track_path)
-                pygame.mixer.music.set_volume(self.volumes["backing"])
+                pygame.mixer.music.set_volume(min(1.0, self.volumes["backing"]))
                 pygame.mixer.music.play()
             except Exception as e:
                 print(f"Error playing music: {e}")
 
-        # Start recording if in dubbing mode
-        if mode == "dubbing":
-            self.start_mic_recording()
-
         self.start_wall_time = time.time()
+        if play_user_take:
+            self._play_line_audio(self.user_recorded_file, volume=self.volumes["voice"])
         max_duration = max([d["timestamp"] for d in self.dialogues], default=60.0) + 6.0
 
-        while not self.stop_event.is_set():
+        while not stop_event.is_set():
             if self.is_paused:
                 time.sleep(0.05)
                 continue
@@ -154,14 +179,22 @@ class AudioPlayer:
                             self._play_line_audio(self.custom_recordings[d_id], volume=self.volumes["voice"])
                         elif not is_dubbed_role:
                             self._play_line_audio(d.get("audio_file"), volume=self.volumes["original"])
+                        elif not play_user_take:
+                            # No recording of the user for this role: fall back to the original line
+                            self._play_line_audio(d.get("audio_file"), volume=self.volumes["original"])
 
-            if on_update:
+            if on_update and not stop_event.is_set():
                 try:
                     on_update(self.current_time)
                 except:
                     pass
 
             time.sleep(0.02)
+
+        # A newer playback may already own the mixer and the mic: only clean up if we are
+        # still the current playback (stop() already cleaned up when it was called).
+        if stop_event is not self.stop_event:
+            return
 
         if mode == "dubbing":
             self.stop_mic_recording()
@@ -173,7 +206,7 @@ class AudioPlayer:
             except:
                 pass
 
-        if on_finish and not self.stop_event.is_set():
+        if on_finish and not stop_event.is_set():
             try:
                 on_finish()
             except:
@@ -182,13 +215,13 @@ class AudioPlayer:
     def _play_line_audio(self, filename, volume=1.0):
         if not filename or not self.scene_folder or not PYGAME_AVAILABLE:
             return
-        audio_path = os.path.join(self.scene_folder, filename)
+        audio_path = filename if os.path.isabs(filename) else os.path.join(self.scene_folder, filename)
         if not os.path.exists(audio_path):
             return
 
         try:
             sound = pygame.mixer.Sound(audio_path)
-            sound.set_volume(volume)
+            sound.set_volume(min(1.0, volume))
             sound.play()
         except Exception as e:
             # Fallback on macOS afplay
@@ -204,6 +237,7 @@ class AudioPlayer:
             if PYGAME_AVAILABLE:
                 try:
                     pygame.mixer.music.pause()
+                    pygame.mixer.pause()  # character lines / user take (Sound channels)
                 except:
                     pass
 
@@ -214,6 +248,7 @@ class AudioPlayer:
             if PYGAME_AVAILABLE:
                 try:
                     pygame.mixer.music.unpause()
+                    pygame.mixer.unpause()
                 except:
                     pass
 
@@ -248,7 +283,8 @@ class AudioPlayer:
         self.is_recording = True
 
         def callback(indata, frames, time_info, status):
-            if self.is_recording:
+            # Skip audio while paused so the take stays aligned with the scene timeline
+            if self.is_recording and not self.is_paused:
                 self.record_frames.append(indata.copy())
 
         try:

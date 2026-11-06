@@ -6,3 +6,5 @@ temp_*
 *.tmp
 .DS_Store
 saved_scenes/
+multiplayer_room/
+tools/

@@ -52,7 +52,15 @@ class SceneManager:
 
         try:
             with zipfile.ZipFile(zip_path, "r") as z:
-                names = z.namelist()
+                # Ignore folders and the hidden metadata macOS adds when compressing
+                # (__MACOSX/ and AppleDouble "._*" files), which are not real scene files.
+                names = [
+                    n for n in z.namelist()
+                    if not n.endswith("/")
+                    and not n.startswith("__MACOSX/")
+                    and not os.path.basename(n).startswith("._")
+                    and os.path.basename(n) != ".DS_Store"
+                ]
                 if not names:
                     return False, "El archivo ZIP está vacío.", None
 
@@ -79,6 +87,9 @@ class SceneManager:
                     raw_ini = z.read(ini_name).decode("utf-8", errors="replace")
                     parsed_ini = self._parse_ini_content(raw_ini)
                     pack_info.update(parsed_ini)
+                pack_info["title"] = str(pack_info.get("title") or os.path.splitext(os.path.basename(zip_path))[0])
+                pack_info["authors"] = [str(a) for a in self._as_list(pack_info.get("authors"))] or ["Desconocido"]
+                pack_info["preselected_dub_characters"] = [str(c) for c in self._as_list(pack_info.get("preselected_dub_characters"))]
 
                 # 2. Locate video and backing track
                 video_file = None
@@ -89,7 +100,10 @@ class SceneManager:
 
                 backing_track = None
                 for n in names:
-                    if "backing_track" in n.lower() or "background" in n.lower() or "music" in n.lower():
+                    base_lower = os.path.basename(n).lower()
+                    if not base_lower.endswith((".mp3", ".ogg", ".wav")):
+                        continue
+                    if "backing_track" in base_lower or "background" in base_lower or "music" in base_lower:
                         backing_track = n
                         break
 
@@ -98,7 +112,11 @@ class SceneManager:
                 dialogue_files.sort()
 
                 dialogues = []
-                characters_set = set(pack_info.get("preselected_dub_characters", []))
+                # Ordered, de-duplicated list (a set would shuffle the order between runs)
+                characters = []
+                for c in pack_info.get("preselected_dub_characters", []):
+                    if c and c not in characters:
+                        characters.append(c)
 
                 for df in dialogue_files:
                     raw_txt = z.read(df).decode("utf-8", errors="replace")
@@ -108,28 +126,31 @@ class SceneManager:
                     # Match audio file
                     matching_audio = None
                     for ext in [".mp3", ".ogg", ".wav"]:
-                        possible_audio = f"{prefix}{base}{ext}"
+                        possible_audio = f"{df[:df.rfind('/') + 1]}{base}{ext}"
                         if possible_audio in names:
                             matching_audio = os.path.basename(possible_audio)
                             break
 
                     char_name = "Personaje"
-                    if parsed_d.get("dub_characters") and len(parsed_d["dub_characters"]) > 0:
-                        char_name = parsed_d["dub_characters"][0]
+                    dub_chars = self._as_list(parsed_d.get("dub_characters"))
+                    if dub_chars:
+                        char_name = str(dub_chars[0])
                     elif parsed_d.get("character"):
-                        char_name = parsed_d["character"]
-                    characters_set.add(char_name)
+                        char_name = str(parsed_d["character"])
+                    if char_name not in characters:
+                        characters.append(char_name)
 
                     timestamp = 0.0
-                    if parsed_d.get("dub_timestamps") and len(parsed_d["dub_timestamps"]) > 0:
+                    dub_times = self._as_list(parsed_d.get("dub_timestamps"))
+                    if dub_times:
                         try:
-                            timestamp = float(parsed_d["dub_timestamps"][0])
-                        except:
+                            timestamp = float(dub_times[0])
+                        except (TypeError, ValueError):
                             timestamp = 0.0
 
                     dialogues.append({
                         "id": base,
-                        "caption": parsed_d.get("caption", "").strip('"“’\''),
+                        "caption": str(parsed_d.get("caption", "")).strip('"“”‘’\''),
                         "image": parsed_d.get("image", ""),
                         "character": char_name,
                         "timestamp": timestamp,
@@ -156,14 +177,16 @@ class SceneManager:
                 dest_dir = os.path.join(self.scenes_dir, scene_id)
                 os.makedirs(dest_dir, exist_ok=True)
 
-                # Extract all files into dest_dir
+                # Extract all files flat into dest_dir: the game and the audio player look
+                # files up by bare file name. Using only the base name also prevents
+                # "Zip Slip" entries such as "../../x" or "/abs/path" from escaping dest_dir.
                 for item_name in names:
-                    if item_name.endswith("/"):
+                    rel_name = os.path.basename(item_name.replace("\\", "/"))
+                    if not rel_name or rel_name in (".", ".."):
                         continue
-                    # Remove prefix for flat / clean access
-                    rel_name = item_name[len(prefix):] if item_name.startswith(prefix) else os.path.basename(item_name)
                     target_file = os.path.join(dest_dir, rel_name)
-                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                    if os.path.dirname(os.path.realpath(target_file)) != os.path.realpath(dest_dir):
+                        continue
                     with open(target_file, "wb") as f_out:
                         f_out.write(z.read(item_name))
 
@@ -174,7 +197,7 @@ class SceneManager:
                     "icon": pack_info.get("icon", "ts.png"),
                     "authors": pack_info.get("authors", ["Desconocido"]),
                     "readme": pack_info.get("readme", ""),
-                    "characters": list(characters_set),
+                    "characters": characters,
                     "duration": duration,
                     "dialogues": dialogues,
                     "video_file": os.path.basename(video_file) if video_file else None,
@@ -218,6 +241,15 @@ class SceneManager:
             return True, f"Escena exportada en {output_zip_path}"
         except Exception as e:
             return False, str(e)
+
+    @staticmethod
+    def _as_list(value):
+        """INI values may be written as a list (["a", "b"]) or as a single value (a)."""
+        if value is None or value == "":
+            return []
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
 
     def _parse_ini_content(self, text):
         """Custom helper to parse Godot/INI-like scene formats."""

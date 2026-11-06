@@ -9,13 +9,20 @@ import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
+import { pipeline } from 'stream';
 import { fileURLToPath } from 'url';
 import { ZipEngine } from './src/zip-engine.js';
+import { GameRoom } from './room-server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 3000;
+// Local game server: only reachable from this computer unless HOST is set explicitly.
+// The multiplayer room opens its own LAN ports only while the host has a room open.
+const HOST = process.env.HOST || '127.0.0.1';
+const ROOM_HTTP_PORT = parseInt(process.env.ROOM_PORT || '3001', 10);
+const ROOM_HTTPS_PORT = parseInt(process.env.ROOM_HTTPS_PORT || '3443', 10);
 const PUBLIC_DIR = __dirname;
 const GAMEBANANA_GAME_ID = 20674; // The Choicer Voicer
 
@@ -98,6 +105,7 @@ function pipeUrlStream(url, clientRes, maxRedirects = 10, onHeaders = null) {
       }
     }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume(); // discard the redirect body so the socket is released
         let redirectUrl = res.headers.location;
         if (!redirectUrl.startsWith('http')) {
           redirectUrl = new URL(redirectUrl, url).toString();
@@ -105,14 +113,14 @@ function pipeUrlStream(url, clientRes, maxRedirects = 10, onHeaders = null) {
         return resolve(pipeUrlStream(redirectUrl, clientRes, maxRedirects - 1, onHeaders));
       }
       if (res.statusCode !== 200) {
+        res.resume();
         return reject(new Error(`GameBanana respondió con código HTTP ${res.statusCode}`));
       }
       if (onHeaders) {
         onHeaders(res);
       }
-      res.pipe(clientRes);
-      res.on('end', () => resolve(true));
-      res.on('error', reject);
+      // pipeline() destroys both sides if the upstream fails or the client disconnects
+      pipeline(res, clientRes, (err) => (err ? reject(err) : resolve(true)));
     });
     req.on('error', reject);
   });
@@ -218,19 +226,165 @@ function unpackArchiveWithBsdtar(inputBuffer, ext = '.rar') {
   });
 }
 
+function sendError(res, status, message) {
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify({ error: message }));
+}
+
+/** Collect a POST body, then run handler; errors become a 500 instead of crashing Node */
+function handlePostBody(req, res, handler) {
+  const chunks = [];
+  req.on('data', chunk => chunks.push(chunk));
+  req.on('error', () => res.destroy());
+  req.on('end', async () => {
+    try {
+      await handler(Buffer.concat(chunks));
+    } catch (err) {
+      console.error(`[${req.url}] Error:`, err);
+      sendError(res, 500, err?.message || 'Error interno');
+    }
+  });
+}
+
+/**
+ * The game only talks to its own server (same origin). Reject requests sent by other
+ * websites, which could otherwise make this computer unpack / transcode arbitrary data.
+ */
+function isCrossOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  try {
+    return new URL(origin).host !== req.headers.host;
+  } catch {
+    return true;
+  }
+}
+
+/** Files of the project that must never be served (git data, Python venv, temp files) */
+function isPrivatePath(relPath) {
+  const parts = relPath.split(/[\\/]+/).filter(Boolean);
+  return parts.some(part =>
+    part.startsWith('.') ||
+    part === 'venv' ||
+    part === 'multiplayer_room' || // shared room data and the HTTPS private key
+    part === 'node_modules' ||
+    part.startsWith('temp_')
+  );
+}
+
+/** Parse a single "bytes=a-b" / "bytes=a-" / "bytes=-n" range; null if not satisfiable */
+function parseRange(header, total) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(header).trim());
+  if (!m || (m[1] === '' && m[2] === '') || total === 0) return null;
+  let start;
+  let end;
+  if (m[1] === '') {
+    // Suffix range: the last n bytes
+    const suffix = parseInt(m[2], 10);
+    if (suffix === 0) return null;
+    start = Math.max(0, total - suffix);
+    end = total - 1;
+  } else {
+    start = parseInt(m[1], 10);
+    end = m[2] === '' ? total - 1 : Math.min(parseInt(m[2], 10), total - 1);
+  }
+  if (start >= total || start > end) return null;
+  return { start, end };
+}
+
 const server = http.createServer(async (req, res) => {
-  const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+  try {
+    await handleRequest(req, res);
+  } catch (err) {
+    console.error('Unhandled request error:', err);
+    sendError(res, 500, 'Error interno del servidor');
+  }
+});
+
+// Endpoints that players connected from the local network may use (besides the room
+// API and the game's static files). Heavy local tools (ffmpeg / bsdtar) stay host-only.
+const LAN_ALLOWED_API = new Set(['/api/gamebanana/feed', '/api/gamebanana/download']);
+
+// Files that guests (local network or internet through the free tunnel) may load:
+// only what the game page needs, never the rest of the project folder.
+const GUEST_FILES = new Set(['/', '/index.html', '/styles.css', '/scenes_catalog.json', '/eres_un_juguete_e7314.zip', '/favicon.ico']);
+function isGuestFile(pathname) {
+  return GUEST_FILES.has(pathname) || /^\/src\/[A-Za-z0-9_\-]+\.js$/.test(pathname);
+}
+
+const room = new GameRoom({
+  roomDir: path.join(__dirname, 'multiplayer_room'),
+  httpPort: ROOM_HTTP_PORT,
+  httpsPort: ROOM_HTTPS_PORT,
+  lanHandler
+});
+
+/** Requests arriving on the room's LAN ports (other players' browsers) */
+async function lanHandler(req, res) {
+  try {
+    let url;
+    try {
+      url = new URL(req.url, 'http://sala.local');
+    } catch {
+      sendError(res, 400, 'URL inválida');
+      return;
+    }
+    if (url.pathname.startsWith('/api/room/')) {
+      // Players who run the game on their own computer (http://localhost) call the
+      // host's IP directly, so the room API allows cross-origin requests.
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PUT, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Room-Token, X-Room-Meta, X-Take-Count, X-Part-Index, X-Part-Count');
+      res.setHeader('Access-Control-Max-Age', '600');
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      await room.handle(req, res, url, { mainListener: false });
+      return;
+    }
+    if (url.pathname.startsWith('/api/')) {
+      if (!LAN_ALLOWED_API.has(url.pathname)) {
+        sendError(res, 403, 'No disponible para los invitados de la sala');
+        return;
+      }
+    } else if (!isGuestFile(url.pathname)) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('404 Not Found');
+      return;
+    }
+    await handleRequest(req, res);
+  } catch (err) {
+    console.error('Unhandled room request error:', err);
+    sendError(res, 500, 'Error interno del servidor');
+  }
+}
+
+async function handleRequest(req, res) {
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+  } catch {
+    sendError(res, 400, 'URL inválida');
+    return;
+  }
   const pathname = parsedUrl.pathname;
 
-  // CORS Headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, X-Scene-Title');
+  if (req.method === 'POST' && isCrossOrigin(req)) {
+    sendError(res, 403, 'Origen no permitido');
+    return;
+  }
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
+  // =========================================================================
+  // API: Multiplayer room (host's own browser on this computer)
+  // =========================================================================
+  if (pathname.startsWith('/api/room/') && req.socket.localPort === Number(PORT)) {
+    await room.handle(req, res, parsedUrl, { mainListener: true });
     return;
   }
 
@@ -295,9 +449,9 @@ const server = http.createServer(async (req, res) => {
   // =========================================================================
   if (pathname === '/api/gamebanana/download') {
     const modId = parsedUrl.searchParams.get('modId');
-    if (!modId) {
+    if (!modId || !/^\d+$/.test(modId)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Falta el parámetro modId' }));
+      res.end(JSON.stringify({ error: 'Falta el parámetro modId o no es válido' }));
       return;
     }
 
@@ -328,22 +482,22 @@ const server = http.createServer(async (req, res) => {
 
       console.log(`[GameBanana] Streaming ${fileName} desde ${downloadUrl}...`);
       await pipeUrlStream(downloadUrl, res, 10, (gbRes) => {
-        const totalSize = gbRes.headers['content-length'] || fileInfo._nFilesize || '';
-        res.writeHead(200, {
+        const totalSize = gbRes.headers['content-length'] || fileInfo._nFilesize;
+        const headers = {
           'Content-Type': 'application/octet-stream',
-          'Content-Length': totalSize,
           'Content-Disposition': `attachment; filename="${encodeURIComponent(fileName)}"`,
           'X-File-Name': encodeURIComponent(fileName),
           'X-Scene-Title': encodeURIComponent(modName)
-        });
+        };
+        // An empty Content-Length header makes fetch() fail: only send it when known
+        if (totalSize && /^\d+$/.test(String(totalSize))) headers['Content-Length'] = String(totalSize);
+        res.writeHead(200, headers);
       });
       console.log(`[GameBanana] ✓ Stream completado para "${modName}" (${modId})!`);
     } catch (err) {
       console.error('[GameBanana] Error downloading mod:', err);
-      if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `Error al descargar la escena: ${err.message}` }));
-      }
+      // If the stream already started, abort it so the client sees the failure instead of hanging
+      sendError(res, 500, `Error al descargar la escena: ${err.message}`);
     }
     return;
   }
@@ -352,11 +506,7 @@ const server = http.createServer(async (req, res) => {
   // API: Universal Archive Unpacker & Transcoder (.rar, .zip, .7z)
   // =========================================================================
   if (pathname === '/api/unpack-archive' && req.method === 'POST') {
-    try {
-      const chunks = [];
-      req.on('data', chunk => chunks.push(chunk));
-      req.on('end', async () => {
-        const inputBuf = Buffer.concat(chunks);
+    handlePostBody(req, res, async (inputBuf) => {
         let unzipped = null;
 
         // Try unrar first or bsdtar
@@ -392,11 +542,7 @@ const server = http.createServer(async (req, res) => {
           'Content-Length': sendBuf.length
         });
         res.end(sendBuf);
-      });
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
-    }
+    });
     return;
   }
 
@@ -404,11 +550,7 @@ const server = http.createServer(async (req, res) => {
   // API: Video Transcoding endpoint
   // =========================================================================
   if (pathname === '/api/transcode-video' && req.method === 'POST') {
-    try {
-      const chunks = [];
-      req.on('data', chunk => chunks.push(chunk));
-      req.on('end', async () => {
-        const inputBuf = Buffer.concat(chunks);
+    handlePostBody(req, res, async (inputBuf) => {
         const mp4Buf = await convertOgvToMp4(inputBuf);
         if (mp4Buf) {
           res.writeHead(200, {
@@ -420,25 +562,37 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Transcode failed' }));
         }
-      });
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
-    }
+    });
     return;
   }
 
   // =========================================================================
   // Static Files & Range Requests
   // =========================================================================
-  let reqUrl = decodeURIComponent(pathname);
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    sendError(res, 405, 'Método no permitido');
+    return;
+  }
+
+  let reqUrl;
+  try {
+    reqUrl = decodeURIComponent(pathname);
+  } catch {
+    // Malformed escape such as "/%": used to throw and kill the whole server
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('400 Bad Request');
+    return;
+  }
   if (reqUrl === '/' || reqUrl === '') {
     reqUrl = '/index.html';
   }
 
   const filePath = path.join(PUBLIC_DIR, reqUrl);
+  const relPath = path.relative(PUBLIC_DIR, filePath);
 
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  // Must stay inside the project folder (with a separator: "/x/Juego_backup" is outside)
+  // and must not expose git data, the Python venv or temp files
+  if (relPath.startsWith('..') || path.isAbsolute(relPath) || reqUrl.includes('\0') || isPrivatePath(relPath)) {
     res.writeHead(403, { 'Content-Type': 'text/plain' });
     res.end('Access Denied');
     return;
@@ -457,38 +611,49 @@ const server = http.createServer(async (req, res) => {
 
     const range = req.headers.range;
     if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
-      const chunkSize = (end - start) + 1;
+      const r = parseRange(range, total);
+      if (!r) {
+        res.writeHead(416, { 'Content-Range': `bytes */${total}`, 'Content-Type': 'text/plain' });
+        res.end();
+        return;
+      }
+      const { start, end } = r;
 
       res.writeHead(206, {
         'Content-Range': `bytes ${start}-${end}/${total}`,
         'Accept-Ranges': 'bytes',
-        'Content-Length': chunkSize,
+        'Content-Length': (end - start) + 1,
         'Content-Type': contentType,
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Access-Control-Allow-Origin': '*'
+        'Cache-Control': 'no-cache, no-store, must-revalidate'
       });
 
-      const stream = fs.createReadStream(filePath, { start, end });
-      stream.pipe(res);
+      if (req.method === 'HEAD') { res.end(); return; }
+      // pipeline() closes the file when the browser aborts the request (every video seek)
+      pipeline(fs.createReadStream(filePath, { start, end }), res, () => {});
     } else {
       res.writeHead(200, {
         'Content-Length': total,
         'Content-Type': contentType,
         'Accept-Ranges': 'bytes',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Access-Control-Allow-Origin': '*'
+        'Cache-Control': 'no-cache, no-store, must-revalidate'
       });
 
-      const stream = fs.createReadStream(filePath);
-      stream.pipe(res);
+      if (req.method === 'HEAD') { res.end(); return; }
+      pipeline(fs.createReadStream(filePath), res, () => {});
     }
   });
-});
+}
 
-server.listen(PORT, () => {
+// Close the free internet tunnel together with the game server
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    room.tunnel.stop();
+    process.exit(0);
+  });
+}
+process.on('exit', () => room.tunnel.stop());
+
+server.listen(PORT, HOST, () => {
   console.log(`\n==================================================`);
   console.log(`🎙️  VOICE DUB HERO - SERVIDOR INICIADO`);
   console.log(`🎮  Accede al juego en: http://localhost:${PORT}`);

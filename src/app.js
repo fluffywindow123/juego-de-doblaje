@@ -10,6 +10,27 @@ import { GameDB } from './db.js';
 import { AudioEngine } from './audio-engine.js';
 import { VideoComposer } from './video-composer.js';
 import { SFX } from './sfx.js';
+import { MultiplayerController } from './multiplayer.js';
+
+/**
+ * Escape text for use inside HTML templates (element content and quoted attributes).
+ * Scene titles, authors, character names and captions come from user ZIP files and the
+ * GameBanana API, so they must never be interpreted as markup.
+ */
+function esc(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** Only allow http(s) links coming from external data (no javascript: URLs) */
+function safeUrl(url) {
+  const u = String(url ?? '').trim();
+  return /^https?:\/\//i.test(u) ? u : '#';
+}
 
 export class DubbingApp {
   constructor() {
@@ -83,8 +104,10 @@ export class DubbingApp {
     await this.loadSavedDubs();
     this.selectedScene = this.scenes.length > 0 ? this.scenes[0] : null;
 
+    this.room = new MultiplayerController(this);
     this.render();
     this.bindGlobalEvents();
+    this.room.init().catch(e => console.warn('[Sala] init:', e));
   }
 
   async loadSavedDubs() {
@@ -99,12 +122,19 @@ export class DubbingApp {
   async loadScenes() {
     this.scenes = await GameDB.getAllScenes();
     
-    // Check if ANY scene in database is missing MP4
-    const needsUpgrade = this.scenes.length === 0 || this.scenes.some(s => {
-      if (!s.rawFiles) return true;
-      const keys = Object.keys(s.rawFiles);
-      return !keys.some(k => k.toLowerCase().endsWith('.mp4'));
-    });
+    // Seed the starter scene on first run, or replace it when the stored copy has no MP4.
+    // Only the starter scene is considered: other OGV-only scenes can't be fixed by
+    // re-downloading the starter ZIP (that used to happen on every startup), and a
+    // deleted starter scene must stay deleted while the library has other scenes.
+    const starterId = 'scene_discusion_de_woody_y_buzz_1787187386';
+    const storedStarter = this.scenes.find(s => s.id === starterId);
+    // Players who opened a room link (from another device / the internet) get their
+    // scenes from the room: don't make them wait for the 40 MB starter download first.
+    const isRoomGuestPage = !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname);
+    const needsUpgrade = !isRoomGuestPage && (this.scenes.length === 0 || (!!storedStarter && (
+      !storedStarter.rawFiles ||
+      !Object.keys(storedStarter.rawFiles).some(k => k.toLowerCase().endsWith('.mp4'))
+    )));
 
     if (needsUpgrade) {
       try {
@@ -114,7 +144,6 @@ export class DubbingApp {
           const unzipped = await ZipEngine.unzip(arrayBuf);
           const parsed = ZipEngine.parseScenePackage(unzipped);
           if (parsed && parsed.dialogues && parsed.dialogues.length > 0) {
-            const starterId = 'scene_discusion_de_woody_y_buzz_1787187386';
             const updatedScene = {
               id: starterId,
               title: parsed.meta.title || 'Discusión de Woody y Buzz',
@@ -129,7 +158,7 @@ export class DubbingApp {
               iconName: parsed.meta.iconName,
               imageFiles: parsed.imageFiles,
               rawFiles: parsed.rawFiles,
-              importDate: new Date().toISOString()
+              importDate: storedStarter?.importDate || new Date().toISOString()
             };
             await GameDB.saveScene(updatedScene);
             this.scenes = await GameDB.getAllScenes();
@@ -144,20 +173,24 @@ export class DubbingApp {
   }
 
   async upgradeLegacyScenes() {
-    for (const scene of this.scenes) {
+    for (const scene of [...this.scenes]) {
       if (!scene.dialogues) continue;
+      let changed = false;
 
       // Recalculate exact dialogue start, end and duration from timestamps
+      const order = scene.dialogues.map(d => d.id).join('|');
       scene.dialogues.sort((a, b) => a.timestamp - b.timestamp);
+      if (scene.dialogues.map(d => d.id).join('|') !== order) changed = true;
       for (let i = 0; i < scene.dialogues.length; i++) {
         const cur = scene.dialogues[i];
         const next = scene.dialogues[i + 1];
-        if (next) {
-          cur.duration = Math.max(1.2, parseFloat((next.timestamp - cur.timestamp).toFixed(3)));
-          cur.endTime = next.timestamp;
-        } else {
-          cur.duration = 5.0;
-          cur.endTime = cur.timestamp + 5.0;
+        const duration = next ? Math.max(1.2, parseFloat((next.timestamp - cur.timestamp).toFixed(3))) : 5.0;
+        const endTime = next ? next.timestamp : cur.timestamp + 5.0;
+        // Only fill in missing timing: the take studio refines duration from the real audio
+        if (cur.duration === undefined || cur.endTime === undefined) {
+          cur.duration = duration;
+          cur.endTime = endTime;
+          changed = true;
         }
       }
 
@@ -178,6 +211,7 @@ export class DubbingApp {
               scene.rawFiles[mp4Key] = new Uint8Array(mp4Buf);
               delete scene.rawFiles[ogvKey];
               scene.videoKey = mp4Key;
+              changed = true;
               console.log(`[Auto-Upgrade] ✓ "${scene.title}" actualizada a MP4 HD con éxito!`);
             }
           } catch (e) {
@@ -186,13 +220,23 @@ export class DubbingApp {
         }
       }
 
-      await GameDB.saveScene(scene);
+      // Don't resurrect a scene the user deleted while this (non-awaited) loop was running
+      if (!changed || !this.scenes.some(s => s.id === scene.id)) continue;
+      try {
+        await GameDB.saveScene(scene);
+      } catch (e) {
+        console.warn('[Auto-Upgrade] Could not save scene:', scene.id, e);
+      }
     }
   }
 
   render() {
     const appEl = document.getElementById('app');
     if (!appEl) return;
+
+    // Keep visible toasts and an open modal across re-renders (they live inside #app)
+    const oldToastRoot = document.getElementById('toast-root');
+    const oldModalRoot = document.getElementById('modal-root');
 
     appEl.innerHTML = `
       ${this.renderNavbar()}
@@ -204,7 +248,41 @@ export class DubbingApp {
       <div id="toast-root" class="toast-container"></div>
     `;
 
+    if (oldToastRoot && oldToastRoot.childElementCount > 0) {
+      document.getElementById('toast-root')?.replaceWith(oldToastRoot);
+    }
+    if (oldModalRoot && oldModalRoot.childElementCount > 0) {
+      document.getElementById('modal-root')?.replaceWith(oldModalRoot);
+    }
+
+    // OGV decoders whose <video> was just replaced keep playing audio when detached
+    this.stopDetachedOgvPlayers();
+
     this.bindViewEvents();
+  }
+
+  /** Remember an OGVPlayer so it can be paused when its screen goes away */
+  registerOgvPlayer(player) {
+    if (!this.ogvPlayers) this.ogvPlayers = new Set();
+    this.ogvPlayers.add(player);
+  }
+
+  stopOgvPlayer(player) {
+    try { player.pause(); } catch {}
+    try { if (typeof player.stop === 'function') player.stop(); } catch {}
+    this.ogvPlayers?.delete(player);
+  }
+
+  pauseAllOgvPlayers() {
+    for (const p of (this.ogvPlayers || [])) {
+      try { p.pause(); } catch {}
+    }
+  }
+
+  stopDetachedOgvPlayers() {
+    for (const p of Array.from(this.ogvPlayers || [])) {
+      if (!p.isConnected) this.stopOgvPlayer(p);
+    }
   }
 
   renderNavbar() {
@@ -239,6 +317,7 @@ export class DubbingApp {
           <button class="nav-btn ${this.currentView === 'characters' ? 'active' : ''}" id="nav-characters">
             🎭 Personajes
           </button>
+          <button class="nav-btn ${this.currentView === 'room' ? 'active' : ''}" id="nav-room" style="color: var(--neon-green); border-color: rgba(0,255,136,0.35);">${this.room ? esc(this.room.navLabel()) : '👥 Multijugador'}</button>
           <button class="nav-btn ${this.currentView === 'settings' ? 'active' : ''}" id="nav-settings">
             ⚙️ Configuración
           </button>
@@ -276,6 +355,7 @@ export class DubbingApp {
       case 'results': return this.renderResultsView();
       case 'characters': return this.renderCharactersView();
       case 'settings': return this.renderSettingsView();
+      case 'room': return this.room ? this.room.render() : this.renderHomeView();
       default: return this.renderHomeView();
     }
   }
@@ -564,6 +644,15 @@ export class DubbingApp {
     this.isTakePlayingRef = false;
     this.isTakeRecording = false;
     this.isTakePlayingUser = false;
+    this.isTakeArming = false;
+    this.playDubResumeAfterSeek = false;
+    // Invalidate any take countdown / recording still awaiting, and stop the recorder
+    this.takeSessionToken = (this.takeSessionToken || 0) + 1;
+    this.audio.cancelRecording();
+    if (this.activeTakeMediaEl) {
+      try { this.activeTakeMediaEl.pause(); } catch {}
+      this.activeTakeMediaEl = null;
+    }
 
     if (this.animFrameId) {
       cancelAnimationFrame(this.animFrameId);
@@ -599,8 +688,13 @@ export class DubbingApp {
       this.backingAudioEl = null;
     }
 
-    // 3. Pause and clean all dialogue audio elements across all scenes
-    for (const scene of this.scenes) {
+    // 3. Pause and clean all dialogue audio elements across all scenes (including the
+    //    selected scene object and the snapshot of the dub being played, which can be
+    //    different objects from the ones in this.scenes)
+    const scenesWithAudio = new Set(this.scenes);
+    if (this.selectedScene) scenesWithAudio.add(this.selectedScene);
+    if (this.activePlayingDub?.sceneSnapshot) scenesWithAudio.add(this.activePlayingDub.sceneSnapshot);
+    for (const scene of scenesWithAudio) {
       for (const d of (scene.dialogues || [])) {
         if (d.audioEl) {
           try {
@@ -613,7 +707,7 @@ export class DubbingApp {
       }
     }
 
-    // 4. Pause all active video players
+    // 4. Pause all active video players (native <video> and OGV decoders)
     ['studio-video', 'take-video', 'play-dub-video', 'results-video'].forEach(id => {
       const v = document.getElementById(id);
       if (v) {
@@ -623,6 +717,7 @@ export class DubbingApp {
         } catch {}
       }
     });
+    for (const p of Array.from(this.ogvPlayers || [])) this.stopOgvPlayer(p);
 
     this.playedDialogueIds.clear();
     this.playDubPlayedIds.clear();
@@ -639,8 +734,20 @@ export class DubbingApp {
 
   navigate(viewName, params = {}) {
     SFX.playClick();
-    const isNewScene = params.scene && (!this.selectedScene || params.scene.id !== this.selectedScene.id);
+    // Takes / waveforms are keyed by dialogue id (e.g. "01_woody"), which repeats across
+    // scenes: reset them whenever the target scene differs from the one they belong to,
+    // including callers that set this.selectedScene before calling navigate().
+    const targetScene = params.scene || this.selectedScene;
+    const isNewScene = !!targetScene && targetScene.id !== this.sceneStateId;
+    if (isNewScene || !['character_select', 'take_studio', 'results', 'play_dub', 'studio'].includes(viewName)) {
+      this.completingDub = null;
+    }
     this.stopAllAudioAndResetSceneState(isNewScene);
+    if (targetScene) this.sceneStateId = targetScene.id;
+    if (viewName !== 'take_studio' && viewName !== 'studio' && viewName !== 'room') {
+      // Turn the microphone (and the browser's recording indicator) off
+      this.audio.releaseMicrophone();
+    }
 
     this.currentView = viewName;
     if (params.scene) this.selectedScene = params.scene;
@@ -693,6 +800,9 @@ export class DubbingApp {
             <button class="btn-secondary" id="btn-hero-library">
               📚 Mis Escenas (${this.scenes.length})
             </button>
+            <button class="btn-cyan" id="btn-home-multiplayer" style="font-size: 1.05rem; padding: 0.8rem 1.7rem; background: linear-gradient(135deg, var(--neon-green), #00b86b); color: #000; font-weight: 900;">
+              👥 MULTIJUGADOR
+            </button>
           </div>
         </div>
 
@@ -700,11 +810,11 @@ export class DubbingApp {
           ${featuredScene ? `
             <div class="featured-card">
               <div class="featured-cover-wrapper">
-                <img src="${coverUrl}" class="featured-cover-img" alt="${featuredScene.title}" />
+                <img src="${coverUrl}" class="featured-cover-img" alt="${esc(featuredScene.title)}" />
                 <span class="featured-badge">🔥 ESCENA DISPONIBLE</span>
               </div>
               <div class="featured-info">
-                <h3 class="featured-title">${featuredScene.title}</h3>
+                <h3 class="featured-title">${esc(featuredScene.title)}</h3>
                 
                 <div style="display: flex; gap: 0.6rem; align-items: center; margin: 0.6rem 0 1rem 0;">
                   ${characters.map(charName => {
@@ -712,7 +822,7 @@ export class DubbingApp {
                     return `
                       <div style="display: flex; align-items: center; gap: 0.35rem; background: rgba(255,255,255,0.08); padding: 0.25rem 0.65rem; border-radius: 20px; border: 1px solid var(--border-glass);">
                         <img src="${charImg}" style="width: 26px; height: 26px; border-radius: 50%; object-fit: cover;" />
-                        <span style="font-size: 0.8rem; font-weight: 700; color: var(--neon-yellow);">${charName}</span>
+                        <span style="font-size: 0.8rem; font-weight: 700; color: var(--neon-yellow);">${esc(charName)}</span>
                       </div>
                     `;
                   }).join('')}
@@ -832,13 +942,13 @@ export class DubbingApp {
     return `
       <div class="scene-card" data-scene-id="${scene.id}">
         <div class="scene-thumb-wrapper">
-          <img src="${coverUrl}" class="scene-thumb" alt="${scene.title}" />
+          <img src="${coverUrl}" class="scene-thumb" alt="${esc(scene.title)}" />
           <div class="scene-overlay-badge">⏱️ ${durationFormatted}</div>
         </div>
 
         <div class="scene-body">
-          <h3 class="scene-name" title="${scene.title}">${scene.title}</h3>
-          <div class="scene-author">Por: ${(scene.authors || []).join(', ')}</div>
+          <h3 class="scene-name" title="${esc(scene.title)}">${esc(scene.title)}</h3>
+          <div class="scene-author">Por: ${esc((scene.authors || []).join(', '))}</div>
 
           <div class="scene-characters-list">
             ${characters.map(c => {
@@ -846,7 +956,7 @@ export class DubbingApp {
               return `
                 <div style="display: flex; align-items: center; gap: 0.35rem; background: rgba(255,255,255,0.06); padding: 0.2rem 0.5rem; border-radius: 16px; border: 1px solid var(--border-glass);">
                   <img src="${charImg}" style="width: 22px; height: 22px; border-radius: 50%; object-fit: cover;" />
-                  <span style="font-size: 0.75rem; color: var(--neon-yellow); font-weight: 600;">${c}</span>
+                  <span style="font-size: 0.75rem; color: var(--neon-yellow); font-weight: 600;">${esc(c)}</span>
                 </div>
               `;
             }).join('')}
@@ -931,9 +1041,9 @@ export class DubbingApp {
     return `
       <div class="scene-card" style="border-color: rgba(255,0,128,0.3); box-shadow: 0 8px 25px rgba(255,0,128,0.15);">
         <div class="scene-thumb-wrapper" style="height: 190px;">
-          <img src="${coverUrl}" class="scene-thumb" alt="${dub.sceneTitle}" />
+          <img src="${coverUrl}" class="scene-thumb" alt="${esc(dub.sceneTitle)}" />
           <div class="scene-overlay-badge" style="background: linear-gradient(135deg, var(--neon-pink), #c70063); color: #fff;">
-            🎙️ Doblado: ${charName}
+            🎙️ Doblado: ${esc(charName)}
           </div>
           ${dub.rank ? `
             <div style="position: absolute; top: 10px; right: 10px; background: var(--neon-yellow); color: #000; font-weight: 900; font-size: 1rem; width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center; box-shadow: 0 0 12px rgba(255,230,0,0.7);">
@@ -943,26 +1053,34 @@ export class DubbingApp {
         </div>
 
         <div class="scene-body">
-          <h3 class="scene-name" title="${dub.sceneTitle}">
-            ${dub.sceneTitle}
+          <h3 class="scene-name" title="${esc(dub.sceneTitle)}">
+            ${esc(dub.sceneTitle)}
           </h3>
 
           <div style="display:flex; align-items:center; gap:0.5rem; margin: 0.5rem 0;">
             ${charImg ? `<img src="${charImg}" style="width: 28px; height: 28px; border-radius: 50%; object-fit: cover; border: 2px solid var(--neon-cyan);" />` : ''}
-            <span style="font-size: 0.85rem; font-weight: 700; color: var(--neon-cyan);">Rol: ${charName}</span>
+            <span style="font-size: 0.85rem; font-weight: 700; color: var(--neon-cyan);">Rol: ${esc(charName)}</span>
             <span style="color: var(--text-dim);">•</span>
             <span style="font-size: 0.8rem; color: var(--neon-yellow);">Filtro: ${dub.effectApplied || 'Normal'}</span>
           </div>
 
           <div class="scene-meta-row">
             <span>📅 ${dateFormatted}</span>
-            <span>💬 ${takesCount} frases con tu voz</span>
+            <span>${dub.room ? `👥 Doblaje en grupo (${(dub.room.players || []).length} voces)` : (dub.completedFrom ? '👥 Grupo + tus voces' : `💬 ${takesCount} frases con tu voz`)}</span>
           </div>
+          ${dub.room && this.getMissingCharacters(dub).length ? `
+            <div style="font-size:0.78rem; color:var(--text-muted); margin:0.25rem 0 0.4rem;">🗣️ Con voz original: ${esc(this.getMissingCharacters(dub).join(', '))}</div>
+          ` : ''}
 
           <div class="scene-actions-row">
             <button class="btn-card-play btn-play-saved-dub" data-id="${dub.id}" style="background: linear-gradient(135deg, var(--neon-pink), #c70063); color: #fff; font-weight: 800; font-size: 0.85rem;" title="Reproducir escena completa con tu voz grabada">
               ▶️ VER MI DOBLAJE
             </button>
+            ${dub.room && this.getMissingCharacters(dub).length ? `
+              <button class="btn-card-play btn-complete-dub" data-id="${esc(dub.id)}" style="background: linear-gradient(135deg, var(--neon-green), #00a852); color: #000; font-weight: 800; font-size: 0.8rem;" title="Graba por tu cuenta los personajes que nadie dobló">
+                🎙️ Completar voces
+              </button>
+            ` : ''}
             <button class="btn-icon-action btn-delete-saved-dub" data-id="${dub.id}" title="Eliminar este doblaje" style="color: var(--neon-pink);">
               🗑️
             </button>
@@ -996,7 +1114,7 @@ export class DubbingApp {
           </button>
           <div style="display:flex; align-items:center; gap:0.6rem;">
             <span class="char-badge" style="background: rgba(255,0,128,0.2); border-color: var(--neon-pink); color: #fff;">
-              🎙️ Tu Actuación como: ${charName}
+              🎙️ Tu Actuación como: ${esc(charName)}
             </span>
             <span class="char-badge">
               ⭐ ${dub.score || 9500} PTS (${dub.rank || 'S'})
@@ -1010,9 +1128,9 @@ export class DubbingApp {
 
           <!-- Current Speaker Avatar Bubble -->
           <div id="play-dub-avatar-overlay" class="talking-avatar-overlay" style="position: absolute; top: 16px; left: 16px; z-index: 10;">
-            <img id="play-dub-avatar-img" src="${charImg}" class="avatar-bubble-img" alt="${charName}" />
+            <img id="play-dub-avatar-img" src="${charImg}" class="avatar-bubble-img" alt="${esc(charName)}" />
             <div>
-              <div id="play-dub-avatar-name" class="avatar-bubble-name">${charName}</div>
+              <div id="play-dub-avatar-name" class="avatar-bubble-name">${esc(charName)}</div>
               <div id="play-dub-avatar-badge" style="font-size: 0.7rem; color: var(--neon-pink); font-weight: 800;">🎙️ TU VOZ GRABADA</div>
             </div>
           </div>
@@ -1021,7 +1139,7 @@ export class DubbingApp {
         <!-- Real-time Karaoke / Subtitle Teleprompter Bar -->
         <div class="teleprompter-card" style="margin-bottom: 1.5rem; text-align: center; padding: 1.25rem; background: rgba(10,12,24,0.9); border: 2px solid var(--border-glass); border-radius: var(--radius-lg);">
           <div id="play-dub-quote" class="teleprompter-quote" style="font-size: 1.4rem; font-weight: 800; color: #fff; min-height: 2.2rem;">
-            "${dub.takes?.[0]?.caption || 'Pulsa Reproducir para escuchar tu doblaje...'}"
+            "${esc(dub.takes?.[0]?.caption || 'Pulsa Reproducir para escuchar tu doblaje...')}"
           </div>
         </div>
 
@@ -1050,8 +1168,27 @@ export class DubbingApp {
     `;
   }
 
+  /**
+   * Show the play-dub screen and start playback. navigate() resets every audio player,
+   * so it must run BEFORE setupPlayDub() builds the backing / dialogue players.
+   */
+  async openPlayDub(dubRecord) {
+    this.activePlayingDub = dubRecord;
+    this.navigate('play_dub');
+    try {
+      await this.setupPlayDub(dubRecord);
+    } finally {
+      this.playDubLoading = false;
+    }
+    // The user may have left the screen (or opened another dub) while takes were decoding
+    if (this.currentView === 'play_dub' && this.activePlayingDub === dubRecord) {
+      this.startPlayDubLoop();
+    }
+  }
+
   async setupPlayDub(dubRecord) {
     this.stopStudioPlayback();
+    this.playDubLoading = true;
     this.activePlayingDub = dubRecord;
     await this.audio.init();
 
@@ -1096,7 +1233,8 @@ export class DubbingApp {
         }
 
         if (arrayBuf && arrayBuf.byteLength > 0) {
-          const audioBuf = await this.audio.decodeAudio(arrayBuf, `user_dub_${take.dialogueId}`);
+          // No cache key: takes are re-recorded under the same dialogue id
+          const audioBuf = await this.audio.decodeAudio(arrayBuf);
           if (audioBuf) {
             this.playDubUserBuffers.set(take.dialogueId, audioBuf);
           }
@@ -1107,6 +1245,26 @@ export class DubbingApp {
     }
 
     console.log(`[setupPlayDub] Decoded ${this.playDubUserBuffers.size} of ${takes.length} user takes`);
+
+    // 1b. Group dubs (multiplayer room): one continuous voice track per player, placed on
+    //     the scene timeline by its offset (negative = recording started before 0:00)
+    this.playDubTracks = [];
+    this.playDubTrackChars = new Map();
+    for (const tr of (dubRecord.tracks || [])) {
+      try {
+        let raw = null;
+        if (tr.audioData instanceof ArrayBuffer) raw = tr.audioData;
+        else if (tr.audioData) raw = await this.toBlob(tr.audioData, tr.audioMimeType || 'audio/webm')?.arrayBuffer();
+        if (tr.character) this.playDubTrackChars.set(tr.character.toLowerCase(), tr.playerName || 'Jugador');
+        if (!raw || raw.byteLength === 0) continue;
+        const buf = await this.audio.decodeAudio(raw);
+        if (buf) {
+          this.playDubTracks.push({ buf, offset: Number(tr.offset) || 0, character: tr.character, playerName: tr.playerName });
+        }
+      } catch (e) {
+        console.warn('[setupPlayDub] Could not decode group track:', tr.playerName, e);
+      }
+    }
 
     // 2. Prepare backing audio (both HTML5 Audio and Web Audio buffer for rock-solid playback)
     this.backingBuffer = null;
@@ -1130,7 +1288,8 @@ export class DubbingApp {
 
     // 3. Prepare other dialogue original audios (only for dialogues that were NOT dubbed by the user)
     for (const d of (sceneSnapshot.dialogues || [])) {
-      const isUserDub = this.playDubUserBuffers.has(d.id) || (dubRecord.takes || []).some(t => t.dialogueId === d.id);
+      const isUserDub = this.playDubUserBuffers.has(d.id) || (dubRecord.takes || []).some(t => t.dialogueId === d.id) ||
+        this.playDubTrackChars.has((d.character || '').toLowerCase());
       if (!isUserDub) {
         const diagUrl = this.getDialogueAudioUrl(sceneSnapshot, d);
         if (diagUrl) {
@@ -1143,10 +1302,15 @@ export class DubbingApp {
     this.currentTime = 0;
     this.duration = dubRecord.duration || sceneSnapshot.duration || 60;
     this.isPlaying = false;
+    this.playDubLoading = false;
   }
 
   async startPlayDubLoop() {
+    if (this.playDubLoading) return;
     this.isPlaying = true;
+    const playDubToken = (this.playDubToken = (this.playDubToken || 0) + 1);
+    // Bail out if the user paused, restarted or left the screen while we were waiting
+    const isStale = () => !this.isPlaying || this.currentView !== 'play_dub' || this.playDubToken !== playDubToken;
     this.startWallTime = performance.now() - (this.currentTime * 1000);
 
     // Mark past dialogues as already played
@@ -1184,6 +1348,7 @@ export class DubbingApp {
             player.id = 'play-dub-ogv-canvas';
             videoEl.parentNode.appendChild(player);
             videoEl._ogvPlayer = player;
+            this.registerOgvPlayer(player);
             videoEl.style.opacity = '0';
           } catch (ogvErr) {
             console.warn('[OGVPlayer PlayDub] Init error:', ogvErr);
@@ -1192,6 +1357,7 @@ export class DubbingApp {
         if (videoEl._ogvPlayer) {
           try { videoEl._ogvPlayer.currentTime = this.currentTime; } catch {}
           try { await videoEl._ogvPlayer.play(); } catch {}
+          if (isStale()) return;
         }
       } else {
         if (vUrl && videoEl.src !== vUrl) {
@@ -1218,6 +1384,7 @@ export class DubbingApp {
           });
         }
 
+        if (isStale()) return;
         videoEl.currentTime = this.currentTime;
         videoEl.removeAttribute('poster');
         try {
@@ -1225,8 +1392,13 @@ export class DubbingApp {
         } catch (e) {
           console.warn('[startPlayDubLoop] Video play warning:', e);
         }
+        if (isStale()) return;
       }
     }
+
+    // Start the scene clock only now that the video is actually running, otherwise
+    // every voice line would fire early by the time spent loading the video.
+    this.startWallTime = performance.now() - (this.currentTime * 1000);
 
     // Play backing track (WAV, MP3 or OGG)
     if (this.backingAudioEl) {
@@ -1236,6 +1408,8 @@ export class DubbingApp {
     } else if (this.backingBuffer) {
       this.audio.playBuffer(this.backingBuffer, 'backing', this.currentTime);
     }
+
+    this.startPlayDubTracks(playDubToken);
 
     const btnToggle = document.getElementById('btn-play-dub-toggle');
     if (btnToggle) {
@@ -1264,13 +1438,14 @@ export class DubbingApp {
         if (this.currentTime >= d.timestamp && !this.playDubPlayedIds.has(d.id)) {
           this.playDubPlayedIds.add(d.id);
 
-          const isUserDubbed = this.playDubUserBuffers.has(d.id) || (this.activePlayingDub?.takes || []).some(t => t.dialogueId === d.id);
+          const isUserDubbed = this.playDubUserBuffers.has(d.id) || (this.activePlayingDub?.takes || []).some(t => t.dialogueId === d.id) ||
+            !!this.playDubTrackChars?.has((d.character || '').toLowerCase());
 
           if (isUserDubbed) {
             // Play USER'S RECORDED TAKE!
             const userBuf = this.playDubUserBuffers.get(d.id);
             if (userBuf) {
-              this.audio.playBuffer(userBuf, 'voice', 0, this.activePlayingDub?.effectApplied || 'clean');
+              this.audio.playBuffer(userBuf, 'voice', 0, null, this.activePlayingDub?.effectApplied || 'clean');
             } else {
               const take = (this.activePlayingDub?.takes || []).find(t => t.dialogueId === d.id);
               if (take && take.audioBlob) {
@@ -1295,6 +1470,22 @@ export class DubbingApp {
     };
 
     this.animFrameId = requestAnimationFrame(loop);
+  }
+
+  /** Start the group voice tracks at the current position of the scene clock */
+  startPlayDubTracks(token) {
+    const effect = this.activePlayingDub?.effectApplied || 'clean';
+    for (const tr of (this.playDubTracks || [])) {
+      const pos = this.currentTime - tr.offset;
+      if (pos >= tr.buf.duration) continue;
+      if (pos >= 0) {
+        this.audio.playBuffer(tr.buf, 'voice', pos, null, effect);
+      } else {
+        setTimeout(() => {
+          if (this.isPlaying && this.playDubToken === token) this.audio.playBuffer(tr.buf, 'voice', 0, null, effect);
+        }, -pos * 1000);
+      }
+    }
   }
 
   pausePlayDub() {
@@ -1333,6 +1524,9 @@ export class DubbingApp {
   togglePlayDub() {
     if (this.isPlaying) {
       this.pausePlayDub();
+    } else if (this.currentTime >= this.duration - 0.05) {
+      // Finished: play again from the start instead of pausing on the first frame
+      this.restartPlayDub();
     } else {
       this.startPlayDubLoop();
     }
@@ -1380,9 +1574,14 @@ export class DubbingApp {
 
       const avatarBadge = document.getElementById('play-dub-avatar-badge');
       const isUserDubbed = this.playDubUserBuffers.has(active.id) || (this.activePlayingDub?.takes || []).some(t => t.dialogueId === active.id);
+      const lineTake = (this.activePlayingDub?.takes || []).find(t => t.dialogueId === active.id);
+      const groupVoice = lineTake?.playerName || this.playDubTrackChars?.get((active.character || '').toLowerCase());
 
       if (avatarBadge) {
-        if (isUserDubbed) {
+        if (groupVoice) {
+          avatarBadge.textContent = `🎙️ VOZ DE ${groupVoice.toUpperCase()}`;
+          avatarBadge.style.color = 'var(--neon-green)';
+        } else if (isUserDubbed) {
           avatarBadge.textContent = '🎙️ TU VOZ GRABADA';
           avatarBadge.style.color = 'var(--neon-pink)';
         } else {
@@ -1426,7 +1625,8 @@ export class DubbingApp {
           audioMimeType: audioMimeType, // Remember the MIME type
           audioBlob: null,            // Don't store Blob (won't survive IndexedDB)
           peaks: Array.from(takeData.peaks || []),
-          score: takeData.score || 92
+          score: takeData.score || 92,
+          playerName: takeData.playerName || null
         });
       }
     }
@@ -1447,9 +1647,18 @@ export class DubbingApp {
     const avgScore = Math.round(takesArray.reduce((acc, t) => acc + (t.score || 85), 0) / takesArray.length);
     const rank = avgScore >= 92 ? 'S' : (avgScore >= 82 ? 'A' : (avgScore >= 70 ? 'B' : 'C'));
 
+    // Completing the missing voices of a group dub: the player's own copy, separate record
+    const completing = this.completingDub && this.completingDub.sceneId === this.selectedScene.id ? this.completingDub : null;
+    if (completing) {
+      const mine = Array.from(new Set(takesArray.filter(t => !t.playerName).map(t => t.character)));
+      charSummary = `${completing.cast}${mine.length ? ` · ${mine.join(' & ')}: tú` : ''}`;
+    }
+
     // Check if a saved dub record already exists for this scene to update or merge it
-    const existingIndex = this.savedDubs.findIndex(d => d.sceneId === this.selectedScene.id);
-    const dubId = existingIndex >= 0 ? this.savedDubs[existingIndex].id : ('dub_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6));
+    const existingIndex = this.savedDubs.findIndex(d => d.sceneId === this.selectedScene.id && !d.room && !d.completedFrom && !(d.tracks || []).length);
+    const dubId = completing
+      ? `${completing.id}_completo`
+      : (existingIndex >= 0 ? this.savedDubs[existingIndex].id : ('dub_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6)));
 
     const dubRecord = {
       id: dubId,
@@ -1462,6 +1671,7 @@ export class DubbingApp {
       rank,
       duration: this.selectedScene.duration || 60,
       takes: takesArray,
+      completedFrom: completing ? completing.id : undefined,
       sceneSnapshot: {
         id: this.selectedScene.id,
         title: this.selectedScene.title,
@@ -1513,7 +1723,7 @@ export class DubbingApp {
       <div class="control-card" style="margin-bottom: 1.5rem; display:flex; gap:1rem; align-items:center; flex-wrap:wrap; justify-content:space-between;">
         <div style="display:flex; gap:0.75rem; flex:1; min-width:280px; align-items:center;">
           <div style="flex:1; position:relative;">
-            <input type="text" id="online-search-input" class="search-box-input" placeholder="🔍 Buscar escena (Toy Story, Shrek, Anime, Neymar...)" value="${this.onlineSearchQuery}" style="width:100%; background:rgba(10,12,22,0.9); border:2px solid var(--border-glass); border-radius:var(--radius-md); padding:0.75rem 1rem 0.75rem 2.8rem; color:#fff; font-size:0.95rem;" />
+            <input type="text" id="online-search-input" class="search-box-input" placeholder="🔍 Buscar escena (Toy Story, Shrek, Anime, Neymar...)" value="${esc(this.onlineSearchQuery)}" style="width:100%; background:rgba(10,12,22,0.9); border:2px solid var(--border-glass); border-radius:var(--radius-md); padding:0.75rem 1rem 0.75rem 2.8rem; color:#fff; font-size:0.95rem;" />
             <span style="position:absolute; left:1rem; top:50%; transform:translateY(-50%); font-size:1.1rem; pointer-events:none;">🔍</span>
           </div>
           <button class="btn-cyan" id="btn-search-online" style="padding:0.75rem 1.4rem;">
@@ -1590,29 +1800,29 @@ export class DubbingApp {
         
         <!-- Multi-select Checkbox -->
         <div style="position:absolute; top:10px; left:10px; z-index:10;">
-          <input type="checkbox" class="mod-checkbox" data-mod-id="${mod.id}" ${isSelected ? 'checked' : ''} style="width:22px; height:22px; cursor:pointer; accent-color:var(--neon-cyan);" />
+          <input type="checkbox" class="mod-checkbox" data-mod-id="${esc(mod.id)}" ${isSelected ? 'checked' : ''} style="width:22px; height:22px; cursor:pointer; accent-color:var(--neon-cyan);" />
         </div>
 
         <div class="scene-thumb-wrapper" style="height:190px; background:#0e1220;">
-          <img src="${thumbUrl}" class="scene-thumb" alt="${mod.title}" onerror="this.src='https://images.gamebanana.com/img/ico/games/669659875eb64.png'" />
+          <img src="${esc(thumbUrl)}" class="scene-thumb" alt="${esc(mod.title)}" onerror="this.src='https://images.gamebanana.com/img/ico/games/669659875eb64.png'" />
           <div class="scene-overlay-badge" style="background:rgba(0,0,0,0.75); border:1px solid rgba(0,240,255,0.4); color:var(--neon-cyan);">
-            👁️ ${mod.views} • ❤️ ${mod.likes}
+            👁️ ${esc(mod.views)} • ❤️ ${esc(mod.likes)}
           </div>
         </div>
 
         <div class="scene-body" style="flex:1; display:flex; flex-direction:column;">
-          <h3 class="scene-name" title="${mod.title}" style="font-size:1.1rem; margin-bottom:0.3rem;">
-            ${mod.title}
+          <h3 class="scene-name" title="${esc(mod.title)}" style="font-size:1.1rem; margin-bottom:0.3rem;">
+            ${esc(mod.title)}
           </h3>
 
           <div style="display:flex; align-items:center; gap:0.4rem; margin-bottom:0.75rem;">
-            ${mod.authorAvatar ? `<img src="${mod.authorAvatar}" style="width:20px; height:20px; border-radius:50%; object-fit:cover;" />` : ''}
-            <span style="font-size:0.8rem; color:var(--text-muted);">Por: <strong style="color:var(--text-dim);">${mod.author}</strong></span>
+            ${mod.authorAvatar ? `<img src="${esc(mod.authorAvatar)}" style="width:20px; height:20px; border-radius:50%; object-fit:cover;" />` : ''}
+            <span style="font-size:0.8rem; color:var(--text-muted);">Por: <strong style="color:var(--text-dim);">${esc(mod.author)}</strong></span>
           </div>
 
           <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.75rem; color:var(--text-muted); border-top:1px solid var(--border-glass); padding-top:0.6rem; margin-top:auto; margin-bottom:0.9rem;">
-            <span class="char-badge" style="font-size:0.7rem; padding:0.15rem 0.5rem;">${mod.category}</span>
-            <a href="${mod.profileUrl}" target="_blank" style="color:var(--neon-cyan); text-decoration:none;" title="Ver en GameBanana">
+            <span class="char-badge" style="font-size:0.7rem; padding:0.15rem 0.5rem;">${esc(mod.category)}</span>
+            <a href="${esc(safeUrl(mod.profileUrl))}" target="_blank" rel="noopener" style="color:var(--neon-cyan); text-decoration:none;" title="Ver en GameBanana">
               Ficha GameBanana ↗
             </a>
           </div>
@@ -1628,10 +1838,10 @@ export class DubbingApp {
               </button>
             ` : `
               <div style="display:flex; gap:0.4rem;">
-                <button class="btn-card-play btn-download-single-mod" data-mod-id="${mod.id}" data-mod-title="${encodeURIComponent(mod.title)}" style="flex:1; background: linear-gradient(135deg, var(--neon-cyan), #0088ff); color: #000; font-weight:800; padding:0.6rem 0.8rem; font-size:0.9rem;" title="Descargar e integrar directamente en el juego">
+                <button class="btn-card-play btn-download-single-mod" data-mod-id="${esc(mod.id)}" data-mod-title="${encodeURIComponent(mod.title)}" style="flex:1; background: linear-gradient(135deg, var(--neon-cyan), #0088ff); color: #000; font-weight:800; padding:0.6rem 0.8rem; font-size:0.9rem;" title="Descargar e integrar directamente en el juego">
                   📥 Descargar al Juego
                 </button>
-                <a href="${mod.profileUrl}#FileInfo_1" target="_blank" class="btn-icon-action" style="text-decoration:none; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.08); border:1px solid var(--border-glass); border-radius:var(--radius-md); padding:0 0.6rem; color:#fff;" title="Descarga de respaldo en Chrome">
+                <a href="${esc(safeUrl(mod.profileUrl))}#FileInfo_1" target="_blank" rel="noopener" class="btn-icon-action" style="text-decoration:none; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.08); border:1px solid var(--border-glass); border-radius:var(--radius-md); padding:0 0.6rem; color:#fff;" title="Descarga de respaldo en Chrome">
                   ⚡
                 </a>
               </div>
@@ -1695,8 +1905,8 @@ export class DubbingApp {
               ${queueList.map(item => `
                 <div class="download-item-card" style="background:rgba(255,255,255,0.04); border:1px solid var(--border-glass); border-radius:var(--radius-md); padding:0.75rem;">
                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
-                    <div style="font-weight:700; font-size:0.85rem; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:210px;" title="${item.title}">
-                      ${item.icon || '📥'} ${item.title}
+                    <div style="font-weight:700; font-size:0.85rem; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:210px;" title="${esc(item.title)}">
+                      ${item.icon || '📥'} ${esc(item.title)}
                     </div>
                     <div style="display:flex; align-items:center; gap:0.4rem;">
                       <span style="font-size:0.8rem; font-weight:800; font-family:monospace; color:${item.status === 'completed' ? 'var(--neon-green)' : 'var(--neon-cyan)'};">
@@ -1714,7 +1924,7 @@ export class DubbingApp {
                   </div>
 
                   <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.75rem; color:var(--text-dim);">
-                    <span>${item.stepText || 'Descargando...'}</span>
+                    <span>${esc(item.stepText || 'Descargando...')}</span>
                     <span>${item.bytesText || ''}</span>
                   </div>
 
@@ -1807,7 +2017,7 @@ export class DubbingApp {
                   <div style="display:flex; align-items:center; gap:0.75rem;">
                     <span style="font-size:1.8rem;">${item.icon || '📥'}</span>
                     <div>
-                      <div style="font-size:1.15rem; font-weight:800; color:#fff;">${item.title}</div>
+                      <div style="font-size:1.15rem; font-weight:800; color:#fff;">${esc(item.title)}</div>
                       <div style="font-size:0.8rem; color:var(--text-dim);">
                         Mod ID: #${item.id} • ${item.bytesText || 'Preparando...'} ${item.speedText ? `• ${item.speedText}` : ''}
                       </div>
@@ -1831,7 +2041,7 @@ export class DubbingApp {
 
                 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
                   <span style="font-size:0.85rem; color:${item.status === 'completed' ? 'var(--neon-green)' : 'var(--neon-cyan)'}; font-weight:600;">
-                    ${item.stepText || 'Descargando...'}
+                    ${esc(item.stepText || 'Descargando...')}
                   </span>
 
                   ${item.status === 'completed' && item.scene ? `
@@ -1850,7 +2060,7 @@ export class DubbingApp {
                       <button class="btn-secondary btn-retry-download" data-mod-id="${item.id}" style="padding:0.35rem 0.75rem; font-size:0.8rem;">
                         🔄 Reintentar
                       </button>
-                      <a href="${item.downloadUrl || `https://gamebanana.com/mods/${item.id}`}" target="_blank" class="btn-cyan" style="text-decoration:none; padding:0.35rem 0.75rem; font-size:0.8rem; background:linear-gradient(135deg, var(--neon-cyan), #0088ff); color:#000; font-weight:800;" title="Abrir y descargar ZIP directamente de GameBanana">
+                      <a href="${esc(safeUrl(item.downloadUrl || `https://gamebanana.com/mods/${item.id}`))}" target="_blank" rel="noopener" class="btn-cyan" style="text-decoration:none; padding:0.35rem 0.75rem; font-size:0.8rem; background:linear-gradient(135deg, var(--neon-cyan), #0088ff); color:#000; font-weight:800;" title="Abrir y descargar ZIP directamente de GameBanana">
                         ⬇️ Descargar Directo (Navegador)
                       </a>
                       <label class="btn-secondary" style="cursor:pointer; padding:0.35rem 0.75rem; font-size:0.8rem; margin:0;" title="Seleccionar el archivo ZIP descargado">
@@ -1873,6 +2083,8 @@ export class DubbingApp {
   // ==========================================
 
   async loadOnlineScenes(page = 1, searchQuery = '') {
+    // Responses of earlier (slower) searches must not overwrite the latest one
+    const requestId = (this.onlineRequestId = (this.onlineRequestId || 0) + 1);
     this.isOnlineLoading = true;
     this.onlinePage = page;
     this.onlineSearchQuery = searchQuery;
@@ -1965,13 +2177,30 @@ export class DubbingApp {
         }
       }
 
+      if (requestId !== this.onlineRequestId) return;
       this.onlineScenes = scenes;
       this.onlineTotal = total || scenes.length;
     } catch (err) {
       console.error('Error in loadOnlineScenes:', err);
-      this.showToast('Error cargando escenas online.', 'error');
+      if (requestId === this.onlineRequestId) this.showToast('Error cargando escenas online.', 'error');
     } finally {
-      this.isOnlineLoading = false;
+      if (requestId === this.onlineRequestId) {
+        this.isOnlineLoading = false;
+        this.refreshAfterBackgroundChange();
+      }
+    }
+  }
+
+  /**
+   * Re-render after a background event (search results, download progress / finish).
+   * On playback / recording screens a full render() would replace the <video>, OGV
+   * canvas and waveform elements mid-playback, so only the download drawer is updated.
+   */
+  refreshAfterBackgroundChange() {
+    const mediaViews = ['studio', 'take_studio', 'play_dub', 'results'];
+    if (mediaViews.includes(this.currentView) || (this.currentView === 'room' && this.room?.isBusy())) {
+      this.updateDrawerUI();
+    } else {
       this.render();
     }
   }
@@ -2020,7 +2249,7 @@ export class DubbingApp {
     if (!nextItem) return;
 
     nextItem.status = 'downloading';
-    this.render();
+    this.refreshAfterBackgroundChange();
 
     this.executeModDownload(nextItem);
   }
@@ -2230,6 +2459,8 @@ export class DubbingApp {
             const mp4ArrayBuf = await transcodeRes.arrayBuffer();
             const mp4Key = ogvKey.replace(/\.ogv$/i, '.mp4');
             unzipped[mp4Key] = new Uint8Array(mp4ArrayBuf);
+            // The OGV is no longer used once the MP4 exists: keeping both doubled the scene size
+            if (mp4ArrayBuf.byteLength > 0) delete unzipped[ogvKey];
           }
         } catch (e) {
           console.warn('Transcode skipped:', e);
@@ -2241,7 +2472,9 @@ export class DubbingApp {
 
       if (validation.isValid) {
         const sceneId = await GameDB.saveScene({
-          title: parsed.meta.title || effectiveTitle,
+          // The GameBanana title (what the player saw and clicked) is usually cleaner than the
+          // pack's own title, which is often a file name like "ytdowncom youtube …"
+          title: effectiveTitle || parsed.meta.title,
           authors: parsed.meta.authors.length ? parsed.meta.authors : ['GameBanana Community'],
           readme: parsed.meta.readme || `Descargado desde GameBanana (Mod #${modId})`,
           characters: parsed.meta.characters,
@@ -2253,20 +2486,23 @@ export class DubbingApp {
           iconName: parsed.meta.iconName,
           imageFiles: parsed.imageFiles,
           rawFiles: parsed.rawFiles,
+          gamebananaId: Number(modId) || null,
           importDate: new Date().toISOString()
         });
 
         this.scenes = await GameDB.getAllScenes();
         const savedScene = this.scenes.find(s => s.id === sceneId);
+        // Shared downloads: everybody in the multiplayer room receives it too
+        this.room?.syncLibrary();
 
         queueItem.status = 'completed';
         queueItem.percent = 100;
         queueItem.stepText = '✅ Lista para jugar';
         queueItem.icon = '✅';
-        queueItem.scene = savedScene || { id: sceneId, title: parsed.meta.title || effectiveTitle };
+        queueItem.scene = savedScene || { id: sceneId, title: effectiveTitle || parsed.meta.title };
 
         SFX.playSuccess();
-        this.showToast(`¡"${parsed.meta.title || effectiveTitle}" lista para doblar!`, 'success');
+        this.showToast(`¡"${effectiveTitle || parsed.meta.title}" lista para doblar!`, 'success');
       } else {
         throw new Error('El paquete descargado no contiene una escena válida de Voice Dub Hero.');
       }
@@ -2277,12 +2513,27 @@ export class DubbingApp {
       queueItem.icon = '⚠️';
       SFX.playError();
     } finally {
-      this.render();
+      this.refreshAfterBackgroundChange();
       this.processNextInQueue();
     }
   }
 
   updateDrawerUI() {
+    // Called for every network chunk: throttle, otherwise the drawer / downloads page is
+    // rebuilt dozens of times per second and clicks on its buttons get lost.
+    const now = performance.now();
+    const wait = 250 - (now - (this.lastDrawerUpdate || 0));
+    if (wait > 0) {
+      if (!this.drawerUpdateTimer) {
+        this.drawerUpdateTimer = setTimeout(() => {
+          this.drawerUpdateTimer = null;
+          this.updateDrawerUI();
+        }, wait);
+      }
+      return;
+    }
+    this.lastDrawerUpdate = now;
+
     // 1. If currently in Downloads View, refresh main content cards in real time
     if (this.currentView === 'downloads') {
       const mainEl = document.querySelector('.main-content') || document.querySelector('.view-container');
@@ -2322,9 +2573,16 @@ export class DubbingApp {
       return charLines.length > 0 && charLines.every(d => this.userTakeRecordings.has(d.id));
     }).length;
     const allCharactersDubbed = characters.length > 0 && completedCharsCount === characters.length;
+    const completing = this.completingDub && this.completingDub.sceneId === this.selectedScene.id ? this.completingDub : null;
 
     return `
       <div style="max-width: 860px; margin: 0 auto;">
+        ${completing ? `
+          <div class="mp-studio-strip" style="margin-top:0;">
+            <b>👥 Completando el doblaje en grupo</b>
+            <span class="mp-help" style="margin:0;">Las voces de ${esc(completing.players.join(', ') || 'tu grupo')} ya están cargadas. Graba por tu cuenta los personajes que faltan; se guardará como tu propia versión.</span>
+          </div>
+        ` : ''}
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
           <button class="btn-secondary" id="btn-back-lib">
             ⬅️ Volver a Mis Escenas
@@ -2337,8 +2595,8 @@ export class DubbingApp {
         <div class="hero-section" style="padding: 2rem; margin-bottom: 2rem;">
           <img src="${coverUrl}" style="width: 140px; height: 140px; border-radius: 18px; object-fit: cover; border: 2px solid var(--neon-cyan); box-shadow: var(--shadow-neon-cyan);" />
           <div>
-            <h2 style="font-size: 1.8rem; font-weight: 800; margin-bottom: 0.5rem;">${this.selectedScene.title}</h2>
-            <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 0.75rem;">${this.selectedScene.readme || 'Prepárate para doblar esta escena.'}</p>
+            <h2 style="font-size: 1.8rem; font-weight: 800; margin-bottom: 0.5rem;">${esc(this.selectedScene.title)}</h2>
+            <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 0.75rem;">${esc(this.selectedScene.readme || 'Prepárate para doblar esta escena.')}</p>
             <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
               <span class="char-badge">⏱️ Duración: ${this.selectedScene.duration || 60}s</span>
               <span class="char-badge">💬 ${this.selectedScene.dialogues?.length || 0} Diálogos Totales</span>
@@ -2383,14 +2641,14 @@ export class DubbingApp {
               const isFullyDubbed = charLines > 0 && charRecordedCount === charLines;
 
               return `
-                <div class="feature-box role-select-card ${isSelected ? 'active-role' : ''}" data-char="${charName}" style="position:relative; cursor:pointer; text-align:center; border-color: ${isSelected ? 'var(--neon-cyan)' : (isFullyDubbed ? 'var(--neon-green)' : 'var(--border-glass)')}; background: ${isSelected ? 'rgba(0, 240, 255, 0.12)' : (isFullyDubbed ? 'rgba(0, 255, 136, 0.08)' : 'var(--bg-card)')};">
+                <div class="feature-box role-select-card ${isSelected ? 'active-role' : ''}" data-char="${esc(charName)}" style="position:relative; cursor:pointer; text-align:center; border-color: ${isSelected ? 'var(--neon-cyan)' : (isFullyDubbed ? 'var(--neon-green)' : 'var(--border-glass)')}; background: ${isSelected ? 'rgba(0, 240, 255, 0.12)' : (isFullyDubbed ? 'rgba(0, 255, 136, 0.08)' : 'var(--bg-card)')};">
                   ${isFullyDubbed ? `
                     <div style="position: absolute; top: 10px; right: 10px; background: linear-gradient(135deg, var(--neon-green), #00bb55); color: #000; font-size: 0.75rem; font-weight: 900; padding: 0.2rem 0.55rem; border-radius: 12px; box-shadow: 0 0 10px rgba(0,255,136,0.6);">
                       ✅ ¡DOBLADO!
                     </div>
                   ` : ''}
                   <img src="${charImg}" style="width: 84px; height: 84px; border-radius: 50%; object-fit: cover; margin: 0 auto 0.75rem auto; border: 3px solid ${isSelected ? 'var(--neon-cyan)' : (isFullyDubbed ? 'var(--neon-green)' : 'rgba(255,255,255,0.2)')}; box-shadow: ${isSelected ? 'var(--shadow-neon-cyan)' : 'none'};" />
-                  <h4 style="font-size: 1.25rem; font-weight: 800;">${charName}</h4>
+                  <h4 style="font-size: 1.25rem; font-weight: 800;">${esc(charName)}</h4>
                   <p style="font-size: 0.85rem; color: ${isFullyDubbed ? 'var(--neon-green)' : (charRecordedCount > 0 ? 'var(--neon-yellow)' : 'var(--text-muted)')}; margin-top: 0.2rem;">
                     ${isFullyDubbed ? `✅ ${charLines} de ${charLines} frases listas` : `${charRecordedCount} de ${charLines} frases grabadas`}
                   </p>
@@ -2413,10 +2671,100 @@ export class DubbingApp {
         </div>
 
         <button class="btn-primary" id="btn-enter-studio" style="width: 100%; padding: 1.1rem; font-size: 1.2rem; justify-content: center;">
-          🎙️ ¡ENTRAR AL ESTUDIO Y DOBLAR A ${this.selectedCharacter.toUpperCase()}!
+          🎙️ ¡ENTRAR AL ESTUDIO Y DOBLAR A ${esc(this.selectedCharacter.toUpperCase())}!
         </button>
       </div>
     `;
+  }
+
+  /** Characters of a group dub that nobody dubbed (they play with the original voice) */
+  getMissingCharacters(dub) {
+    const snap = dub.sceneSnapshot || this.scenes.find(s => s.id === dub.sceneId);
+    if (!snap) return [];
+    const taken = new Set((dub.takes || []).map(t => t.dialogueId));
+    for (const tr of (dub.tracks || [])) {
+      for (const d of (snap.dialogues || [])) {
+        if ((d.character || '').toLowerCase() === (tr.character || '').toLowerCase()) taken.add(d.id);
+      }
+    }
+    return this.getDubbableCharacters(snap).filter(c =>
+      (snap.dialogues || []).some(d => (d.character || '').toLowerCase() === c.toLowerCase() && !taken.has(d.id))
+    );
+  }
+
+  /**
+   * Group dubs leave the characters nobody picked with their original voice. Each player can
+   * complete them on their own: the group's takes are loaded into the studio, the player
+   * records the missing characters and the result is saved as their own copy.
+   */
+  async completeMissingVoices(dub) {
+    if (!(dub.takes || []).length) {
+      this.showToast('Este doblaje no se puede completar (es de una versión anterior del modo en grupo).', 'error');
+      return;
+    }
+    const scene = this.scenes.find(s => s.id === dub.sceneId) ||
+      (dub.sceneSnapshot?.rawFiles ? { ...dub.sceneSnapshot } : null);
+    if (!scene) {
+      this.showToast('No se encontró la escena de este doblaje.', 'error');
+      return;
+    }
+    // navigate() clears the takes when the scene changes: load the group's takes after it
+    this.navigate('character_select', { scene });
+    for (const t of this.userTakeRecordings.values()) {
+      if (t?.url) URL.revokeObjectURL(t.url);
+    }
+    this.userTakeRecordings.clear();
+    for (const take of dub.takes) {
+      const d = (scene.dialogues || []).find(x => x.id === take.dialogueId);
+      if (!d || !take.audioData) continue;
+      const raw = take.audioData instanceof ArrayBuffer
+        ? take.audioData
+        : await this.toBlob(take.audioData, take.audioMimeType || 'audio/webm')?.arrayBuffer();
+      if (!raw) continue;
+      const blob = new Blob([raw], { type: take.audioMimeType || 'audio/webm' });
+      this.userTakeRecordings.set(d.id, {
+        blob,
+        url: URL.createObjectURL(blob),
+        buffer: null,
+        peaks: new Float32Array(take.peaks || []),
+        score: take.score || 90,
+        duration: d.duration,
+        dialogue: d,
+        playerName: take.playerName || null
+      });
+    }
+    const missing = this.getMissingCharacters(dub);
+    this.completingDub = {
+      id: dub.id,
+      sceneId: scene.id,
+      cast: dub.characterDubbed || '',
+      players: dub.room?.players || []
+    };
+    this.selectedCharacter = missing[0] || this.selectedCharacter;
+    this.render();
+    if (missing.length) {
+      this.showToast(`🎙️ Faltan ${missing.length} personaje(s): ${missing.join(', ')}. ¡Grábalos por tu cuenta!`, 'info');
+    } else {
+      this.showToast('Este doblaje ya tiene todas las voces.', 'info');
+    }
+  }
+
+  /** Characters that actually have lines (pack metadata may list names with no dialogue) */
+  getDubbableCharacters(scene) {
+    const dialogues = scene?.dialogues || [];
+    return (scene?.characters || []).filter(c =>
+      dialogues.some(d => (d.character || '').toLowerCase() === String(c).toLowerCase())
+    );
+  }
+
+  /** dataset values are strings while queue keys are numeric mod ids */
+  deleteFromDownloadQueue(modId) {
+    for (const key of this.downloadQueue.keys()) {
+      if (String(key) === String(modId)) {
+        this.downloadQueue.delete(key);
+        return;
+      }
+    }
   }
 
   getDubDialogues() {
@@ -2461,7 +2809,7 @@ export class DubbingApp {
     const recordedCount = dubDialogues.filter(d => this.userTakeRecordings.has(d.id)).length;
     const isCharDone = recordedCount >= totalTakes;
 
-    const characters = this.selectedScene.characters || [];
+    const characters = this.getDubbableCharacters(this.selectedScene);
     const allCharsDone = characters.length > 0 && characters.every(c => {
       const lines = (this.selectedScene.dialogues || []).filter(d => d.character.toLowerCase() === c.toLowerCase());
       return lines.length > 0 && lines.every(d => this.userTakeRecordings.has(d.id));
@@ -2470,29 +2818,34 @@ export class DubbingApp {
       const lines = (this.selectedScene.dialogues || []).filter(d => d.character.toLowerCase() === c.toLowerCase());
       return lines.length > 0 && !lines.every(d => this.userTakeRecordings.has(d.id));
     });
+    // Group dubbing in a multiplayer room: only my character, and the takes go to the room
+    const roomCtx = this.room?.studioContext();
 
     return `
       <div class="take-studio-container">
         <!-- Top Navigation Header -->
         <div class="take-header-card">
           <button class="btn-secondary" id="btn-take-back-char">
-            ⬅️ Menú de Personajes
+            ${roomCtx ? '⬅️ Volver a la sala' : '⬅️ Menú de Personajes'}
           </button>
 
           <div class="take-step-indicator">
             <img src="${charImg}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover; border: 2px solid var(--neon-cyan);" />
-            <span>${activeDiag.character}</span>
+            <span>${esc(activeDiag.character)}</span>
             <span style="color: var(--text-dim);">•</span>
             <span style="color: #fff;">Frase ${currentTakeNum} de ${totalTakes}</span>
           </div>
 
           <div style="display: flex; gap: 0.5rem; align-items: center;">
-            <span class="char-badge" style="font-size: 0.85rem;">🎬 ${this.selectedScene.title}</span>
+            <span class="char-badge" style="font-size: 0.85rem;">🎬 ${esc(this.selectedScene.title)}</span>
+            ${roomCtx ? '' : `
             <button class="btn-secondary" id="btn-switch-to-full-scene" title="Ver la escena original" style="padding: 0.4rem 0.8rem; font-size: 0.85rem;">
               👁️ Escena Original
-            </button>
+            </button>`}
           </div>
         </div>
+
+        ${roomCtx ? `<div id="mp-studio-strip">${this.room.renderStudioStrip()}</div>` : ''}
 
         <!-- Video Player Stage for this Scene Segment -->
         <div class="stage-card" style="position: relative; aspect-ratio: 16 / 9; background: #000; overflow: hidden; border-radius: var(--radius-xl); box-shadow: 0 15px 40px rgba(0,0,0,0.8);">
@@ -2500,9 +2853,9 @@ export class DubbingApp {
 
           <!-- Avatar Overlay -->
           <div id="take-avatar-overlay" class="talking-avatar-overlay" style="position: absolute; top: 16px; left: 16px; z-index: 10;">
-            <img src="${charImg}" class="avatar-bubble-img" alt="${activeDiag.character}" />
+            <img src="${charImg}" class="avatar-bubble-img" alt="${esc(activeDiag.character)}" />
             <div>
-              <div class="avatar-bubble-name">${activeDiag.character}</div>
+              <div class="avatar-bubble-name">${esc(activeDiag.character)}</div>
               <div id="take-avatar-status" style="font-size: 0.7rem; color: var(--neon-cyan);">Listo para doblar</div>
             </div>
           </div>
@@ -2513,7 +2866,7 @@ export class DubbingApp {
 
         <!-- Dialogue Quote -->
         <div class="take-quote-title">
-          "${activeDiag.caption}"
+          "${esc(activeDiag.caption)}"
         </div>
 
         <!-- Waveform Card -->
@@ -2521,17 +2874,17 @@ export class DubbingApp {
           <canvas id="take-waveform-canvas" class="take-waveform-canvas" width="800" height="140"></canvas>
         </div>
 
-        ${isCharDone ? `
+        ${isCharDone && !roomCtx ? `
           <!-- Character Completed Banner -->
           <div style="background: rgba(0, 255, 136, 0.12); border: 2px solid var(--neon-green); border-radius: var(--radius-md); padding: 1rem 1.25rem; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem; box-shadow: 0 0 20px rgba(0,255,136,0.25);">
             <div style="display:flex; align-items:center; gap:0.6rem;">
               <span style="font-size:1.6rem;">✅</span>
               <div>
                 <strong style="color:var(--neon-green); font-size:1.05rem;">
-                  ${allCharsDone ? '🎉 ¡TODOS LOS PERSONAJES DE LA ESCENA ESTÁN DOBLADOS!' : `¡Personaje ${activeDiag.character} Doblado al 100%!`}
+                  ${allCharsDone ? '🎉 ¡TODOS LOS PERSONAJES DE LA ESCENA ESTÁN DOBLADOS!' : `¡Personaje ${esc(activeDiag.character)} Doblado al 100%!`}
                 </strong>
                 <div style="font-size:0.8rem; color:var(--text-muted);">
-                  ${allCharsDone ? 'La escena completa está lista para guardarse y reproducirse de corrido.' : `Ahora dobla a ${nextUnfinishedChar} para completar toda la escena.`}
+                  ${allCharsDone ? 'La escena completa está lista para guardarse y reproducirse de corrido.' : `Puedes doblar a ${esc(nextUnfinishedChar)} o terminar aquí: los personajes que no dobles sonarán con su voz original.`}
                 </div>
               </div>
             </div>
@@ -2544,8 +2897,11 @@ export class DubbingApp {
                   ▶️ REPRODUCIR ESCENA
                 </button>
               ` : `
-                <button id="btn-take-next-char" data-char="${nextUnfinishedChar}" class="btn-cyan" style="background: linear-gradient(135deg, var(--neon-cyan), #0088cc); color: #000; font-weight:900; padding: 0.7rem 1.4rem; font-size: 0.95rem;">
-                  🎙️ Doblar a ${nextUnfinishedChar} ➡️
+                <button id="btn-take-next-char" data-char="${esc(nextUnfinishedChar)}" class="btn-cyan" style="background: linear-gradient(135deg, var(--neon-cyan), #0088cc); color: #000; font-weight:900; padding: 0.7rem 1.4rem; font-size: 0.95rem;">
+                  🎙️ Doblar a ${esc(nextUnfinishedChar)} ➡️
+                </button>
+                <button id="btn-take-finish-partial" class="btn-cyan" style="background: linear-gradient(135deg, var(--neon-green), #00a852); color: #000; font-weight:900; padding: 0.7rem 1.4rem; font-size: 0.95rem;">
+                  🎬 Terminar aquí y ver resultado
                 </button>
                 <button id="btn-take-to-chars" class="btn-secondary" style="padding: 0.7rem 1.2rem; font-size: 0.95rem;">
                   🎭 Menú Personajes
@@ -2578,14 +2934,22 @@ export class DubbingApp {
             <button id="btn-take-next" class="btn-take-primary">
               <span>➡️ Siguiente Frase (${currentTakeNum + 1}/${totalTakes})</span>
             </button>
+          ` : roomCtx ? (isCharDone ? `
+            <button class="btn-take-primary mp-submit-takes" style="background: linear-gradient(135deg, var(--neon-green), #00a852); color: #000; font-weight: 800;">
+              <span>📤 ${roomCtx.submitted ? 'Reenviar mis tomas' : 'Enviar mis tomas a la sala'}</span>
+            </button>
           ` : `
+            <button id="btn-take-first-missing" class="btn-take-primary">
+              <span>⏭️ Ir a la frase que falta (${totalTakes - recordedCount})</span>
+            </button>
+          `) : `
             ${allCharsDone ? `
               <button id="btn-take-finish-scene" class="btn-take-primary" style="background: linear-gradient(135deg, var(--neon-green), #00a852); color: #000; font-weight: 800;">
                 <span>🎬 ¡FINALIZAR Y VER RESULTADO!</span>
               </button>
             ` : `
-              <button id="btn-take-next-char-btn" data-char="${nextUnfinishedChar}" class="btn-take-primary" style="background: linear-gradient(135deg, var(--neon-cyan), #0088cc); color: #000; font-weight: 800;">
-                <span>👉 Siguiente Personaje: ${nextUnfinishedChar} ➡️</span>
+              <button id="btn-take-next-char-btn" data-char="${esc(nextUnfinishedChar)}" class="btn-take-primary" style="background: linear-gradient(135deg, var(--neon-cyan), #0088cc); color: #000; font-weight: 800;">
+                <span>👉 Siguiente Personaje: ${esc(nextUnfinishedChar)} ➡️</span>
               </button>
             `}
           `}
@@ -2601,7 +2965,7 @@ export class DubbingApp {
             ${dubDialogues.map((d, idx) => {
               const done = this.userTakeRecordings.has(d.id);
               const active = idx === this.currentTakeIndex;
-              return `<div class="take-step-pill ${active ? 'active' : (done ? 'completed' : '')}" data-take-idx="${idx}" title="Frase ${idx + 1}: ${d.character}"></div>`;
+              return `<div class="take-step-pill ${active ? 'active' : (done ? 'completed' : '')}" data-take-idx="${idx}" title="Frase ${idx + 1}: ${esc(d.character)}"></div>`;
             }).join('')}
           </div>
         </div>
@@ -2636,12 +3000,12 @@ export class DubbingApp {
             ▶️ Escuchar Escena Original
           </button>
           <button id="tab-mode-dub" class="nav-btn ${!isListenMode ? 'active' : ''}" style="padding: 0.45rem 1rem; font-size: 0.85rem;">
-            🎙️ Grabar Doblaje (${this.selectedCharacter === 'All' ? 'Todos' : this.selectedCharacter})
+            🎙️ Grabar Doblaje (${this.selectedCharacter === 'All' ? 'Todos' : esc(this.selectedCharacter)})
           </button>
         </div>
 
         <div style="display:flex; align-items:center; gap: 0.75rem;">
-          <span class="char-badge" style="font-size:0.85rem;">🎬 ${this.selectedScene.title}</span>
+          <span class="char-badge" style="font-size:0.85rem;">🎬 ${esc(this.selectedScene.title)}</span>
         </div>
       </div>
 
@@ -2658,7 +3022,7 @@ export class DubbingApp {
             <div id="avatar-overlay" class="talking-avatar-overlay" style="position: absolute; top: 16px; left: 16px; z-index: 10;">
               <img id="avatar-bubble-img" src="${initialCharImg}" class="avatar-bubble-img" alt="Avatar" />
               <div>
-                <div id="avatar-bubble-name" class="avatar-bubble-name">${initialChar}</div>
+                <div id="avatar-bubble-name" class="avatar-bubble-name">${esc(initialChar)}</div>
                 <div id="avatar-bubble-status" style="font-size: 0.7rem; color: var(--neon-cyan);">En espera...</div>
               </div>
             </div>
@@ -2677,7 +3041,7 @@ export class DubbingApp {
               return `
                 <div id="char-badge-box-${charKey}" style="display: flex; align-items: center; gap: 0.6rem; background: rgba(19, 23, 38, 0.9); padding: 0.45rem 1.1rem; border-radius: 30px; border: 2px solid var(--border-glass); transition: all 0.25s ease;">
                   <img src="${charImg}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover;" />
-                  <span style="font-size: 0.9rem; font-weight: 800; color: #fff;">${charName}</span>
+                  <span style="font-size: 0.9rem; font-weight: 800; color: #fff;">${esc(charName)}</span>
                 </div>
               `;
             }).join('')}
@@ -2809,8 +3173,8 @@ export class DubbingApp {
     return this.selectedScene.dialogues.map(d => {
       const leftPercent = Math.min(95, Math.max(0, (d.timestamp / totalDuration) * 100));
       return `
-        <div class="timeline-marker marker-woody" style="left: ${leftPercent}%;" title="${d.character}: ${d.caption}" data-jump-time="${d.timestamp}">
-          ${d.character.substring(0, 4)}
+        <div class="timeline-marker marker-woody" style="left: ${leftPercent}%;" title="${esc(d.character)}: ${esc(d.caption)}" data-jump-time="${d.timestamp}">
+          ${esc(d.character.substring(0, 4))}
         </div>
       `;
     }).join('');
@@ -2837,7 +3201,7 @@ export class DubbingApp {
     return `
       <div class="results-container">
         <div class="hero-tag">🎉 ¡DOBLAJE COMPLETADO!</div>
-        <h2 style="font-size: 2.4rem; font-weight: 900; margin-bottom: 0.5rem;">${res.sceneTitle}</h2>
+        <h2 style="font-size: 2.4rem; font-weight: 900; margin-bottom: 0.5rem;">${esc(res.sceneTitle)}</h2>
 
         <div class="rank-banner">
           <div class="rank-letter">${res.rank}</div>
@@ -2936,12 +3300,12 @@ export class DubbingApp {
           ${charactersList.map(char => `
             <div class="scene-card" style="padding: 1.5rem; text-align: center; align-items: center;">
               <img src="${char.imgUrl}" style="width: 110px; height: 110px; border-radius: 50%; object-fit: cover; border: 3px solid var(--neon-cyan); box-shadow: var(--shadow-neon-cyan); margin-bottom: 1rem;" />
-              <h3 style="font-size: 1.4rem; font-weight: 800; margin-bottom: 0.25rem;">${char.name}</h3>
+              <h3 style="font-size: 1.4rem; font-weight: 800; margin-bottom: 0.25rem;">${esc(char.name)}</h3>
               <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1rem;">
                 Aparece en ${char.scenes.length} escena(s) • ${char.totalLines} frases totales
               </p>
-              <button class="btn-cyan btn-char-play-scene" data-scene-id="${char.scenes[0]?.id}" data-char="${char.name}" style="width: 100%;">
-                🎙️ Doblar a ${char.name}
+              <button class="btn-cyan btn-char-play-scene" data-scene-id="${esc(char.scenes[0]?.id)}" data-char="${esc(char.name)}" style="width: 100%;">
+                🎙️ Doblar a ${esc(char.name)}
               </button>
             </div>
           `).join('')}
@@ -3007,6 +3371,7 @@ export class DubbingApp {
         this.navigate('downloads');
       }
       if (e.target.closest('#nav-characters')) this.navigate('characters');
+      if (e.target.closest('#nav-room') || e.target.closest('#btn-home-multiplayer')) this.navigate('room');
       if (e.target.closest('#nav-settings')) this.navigate('settings');
 
       if (e.target.closest('#btn-open-import') || e.target.closest('#btn-lib-import') || e.target.closest('#btn-empty-import') || e.target.closest('#btn-empty-import-2') || e.target.closest('#btn-home-import-zip')) {
@@ -3082,8 +3447,7 @@ export class DubbingApp {
     document.querySelectorAll('.btn-remove-queue-item').forEach(btn => {
       btn.onclick = (e) => {
         e.stopPropagation();
-        const modId = btn.dataset.modId;
-        this.downloadQueue.delete(modId);
+        this.deleteFromDownloadQueue(btn.dataset.modId);
         this.render();
       };
     });
@@ -3116,6 +3480,7 @@ export class DubbingApp {
 
   bindViewEvents() {
     this.bindDrawerEvents();
+    if (this.currentView === 'room' && this.room) this.room.bind();
 
     // DOWNLOADS FULL PAGE VIEW
     const btnClearAllCompleted = document.getElementById('btn-clear-all-completed');
@@ -3144,8 +3509,7 @@ export class DubbingApp {
     document.querySelectorAll('.btn-delete-download').forEach(btn => {
       btn.onclick = (e) => {
         e.stopPropagation();
-        const modId = btn.dataset.modId;
-        this.downloadQueue.delete(modId);
+        this.deleteFromDownloadQueue(btn.dataset.modId);
         this.showToast('Descarga eliminada.', 'info');
         this.render();
       };
@@ -3397,6 +3761,7 @@ export class DubbingApp {
         if (scene && confirm(`¿Estás seguro de eliminar la escena "${scene.title}"?`)) {
           await GameDB.deleteScene(id);
           this.scenes = await GameDB.getAllScenes();
+          this.room?.forgetScene(id); // don't download it again from the room
           SFX.playError();
           this.showToast('Escena eliminada de tu biblioteca.', 'success');
           this.render();
@@ -3460,7 +3825,20 @@ export class DubbingApp {
     if (btnTakeBackChar) {
       btnTakeBackChar.onclick = () => {
         this.stopTakePlayback();
+        if (this.room?.studioContext()) {
+          this.room.inRoomStudio = false;
+          this.navigate('room');
+          return;
+        }
         this.navigate('character_select', { scene: this.selectedScene });
+      };
+    }
+    if (this.currentView === 'take_studio') this.room?.bindStudioStrip();
+    const btnTakeFirstMissing = document.getElementById('btn-take-first-missing');
+    if (btnTakeFirstMissing) {
+      btnTakeFirstMissing.onclick = () => {
+        const idx = this.getDubDialogues().findIndex(d => !this.userTakeRecordings.has(d.id));
+        if (idx >= 0) this.jumpToTake(idx);
       };
     }
 
@@ -3532,6 +3910,11 @@ export class DubbingApp {
     const btnTakeFinish = document.getElementById('btn-take-finish');
     if (btnTakeFinish) {
       btnTakeFinish.onclick = () => this.assembleAndShowResults();
+    }
+
+    const btnTakeFinishPartial = document.getElementById('btn-take-finish-partial');
+    if (btnTakeFinishPartial) {
+      btnTakeFinishPartial.onclick = () => this.assembleAndShowResults();
     }
 
     const btnTakeFinishScene = document.getElementById('btn-take-finish-scene');
@@ -3776,15 +4159,21 @@ export class DubbingApp {
       btnDubsEmptyStart.onclick = () => this.navigate('library');
     }
 
+    document.querySelectorAll('.btn-complete-dub').forEach(btn => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const dub = this.savedDubs.find(d => d.id === btn.dataset.id);
+        if (dub) this.completeMissingVoices(dub);
+      };
+    });
+
     document.querySelectorAll('.btn-play-saved-dub').forEach(btn => {
       btn.onclick = async (e) => {
         e.stopPropagation();
         const dubId = btn.dataset.id;
         const dub = this.savedDubs.find(d => d.id === dubId);
         if (dub) {
-          await this.setupPlayDub(dub);
-          this.navigate('play_dub');
-          this.startPlayDubLoop();
+          await this.openPlayDub(dub);
         }
       };
     });
@@ -3825,13 +4214,28 @@ export class DubbingApp {
     const playDubSeeker = document.getElementById('play-dub-seeker');
     if (playDubSeeker) {
       playDubSeeker.oninput = (e) => {
+        if (this.playDubLoading) return;
+        if (this.isPlaying) {
+          this.playDubResumeAfterSeek = true;
+          this.pausePlayDub();
+        }
         const sec = parseFloat(e.target.value);
         this.currentTime = sec;
-        this.startWallTime = performance.now() - (sec * 1000);
         const v = document.getElementById('play-dub-video');
-        if (v) v.currentTime = sec;
+        if (v) {
+          try { v.currentTime = sec; } catch {}
+          if (v._ogvPlayer) { try { v._ogvPlayer.currentTime = sec; } catch {} }
+        }
         if (this.backingAudioEl) this.backingAudioEl.currentTime = sec;
         this.updatePlayDubUI(sec);
+      };
+      // On release, restart from the new position: startPlayDubLoop() recomputes which
+      // lines were already played and restarts the backing track at the right offset.
+      playDubSeeker.onchange = () => {
+        if (this.playDubResumeAfterSeek) {
+          this.playDubResumeAfterSeek = false;
+          this.startPlayDubLoop();
+        }
       };
     }
 
@@ -3852,6 +4256,7 @@ export class DubbingApp {
         if (confirm('¿Deseas eliminar TODAS las escenas de la base de datos?')) {
           for (const scene of this.scenes) {
             await GameDB.deleteScene(scene.id);
+            this.room?.forgetScene(scene.id);
           }
           this.scenes = [];
           this.showToast('Base de datos reiniciada.', 'success');
@@ -3905,8 +4310,12 @@ export class DubbingApp {
     }
 
     const backingKey = this.selectedScene.backingTrackKey || Object.keys(this.selectedScene.rawFiles || {}).find(k => k.includes('backing_track') || k.includes('background') || k.includes('music') || k.includes('_backing_track'));
-    if (backingKey && this.selectedScene.rawFiles[backingKey] && !this.backingBuffer) {
+    // Always resolve the buffer for THIS scene (playing a saved dub of another scene
+    // replaces this.backingBuffer); decodeAudio caches by key so this is cheap.
+    if (backingKey && this.selectedScene.rawFiles[backingKey]) {
       this.backingBuffer = await this.audio.decodeAudio(this.selectedScene.rawFiles[backingKey], `backing_${this.selectedScene.id}`);
+    } else {
+      this.backingBuffer = null;
     }
 
     // 3. Find the raw audio data for this dialogue line
@@ -3942,7 +4351,7 @@ export class DubbingApp {
     let refPeaks = this.dialogueWaveforms.get(activeDiag.id);
     if (!refPeaks && rawAudio) {
       try {
-        const buf = await this.audio.decodeAudio(rawAudio, `diag_${activeDiag.id}`);
+        const buf = await this.audio.decodeAudio(rawAudio, `diag_${this.selectedScene.id}_${activeDiag.id}`);
         if (buf) {
           refPeaks = this.audio.extractWaveformPeaks(buf, 100);
           this.dialogueWaveforms.set(activeDiag.id, refPeaks);
@@ -4031,6 +4440,7 @@ export class DubbingApp {
             player.id = 'take-ogv-canvas';
             videoEl.parentNode.appendChild(player);
             videoEl._ogvPlayer = player;
+            this.registerOgvPlayer(player);
             videoEl.style.opacity = '0';
           } catch (ogvErr) {
             console.warn('[OGVPlayer] Init error, falling back to standard video:', ogvErr);
@@ -4104,6 +4514,8 @@ export class DubbingApp {
 
   drawWaveform(canvas, refPeaks, playheadRatio = 0, userLiveHistory = null, userRecordedPeaks = null) {
     if (!canvas) return;
+    // Peaks may not be decoded yet when Listen/Rec is pressed right after changing take
+    if (!refPeaks || !refPeaks.length) refPeaks = this.generateSyntheticPeaks(100);
     const ctx = canvas.getContext('2d');
     const rect = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
@@ -4275,13 +4687,27 @@ export class DubbingApp {
   }
 
   async startTakeRecording() {
+    // Ignore clicks while a countdown or a recording is already running
+    if (this.isTakeArming || this.isTakeRecording) return;
     this.stopTakePlayback();
     const dubDialogues = this.getDubDialogues();
     const activeDiag = dubDialogues[this.currentTakeIndex];
     if (!activeDiag) return;
 
+    this.isTakeArming = true;
+    const sessionToken = this.takeSessionToken;
+    // True when the user left the screen / changed take while we were awaiting
+    const cancelled = () => sessionToken !== this.takeSessionToken || this.currentView !== 'take_studio';
+
     await this.audio.init();
-    await this.audio.requestMicrophone();
+    const micStream = await this.audio.requestMicrophone();
+    if (cancelled()) return;
+    if (!micStream) {
+      this.isTakeArming = false;
+      SFX.playError();
+      this.showToast('🎙️ No se pudo acceder al micrófono. Permite el acceso al micrófono en el navegador e inténtalo de nuevo.', 'error');
+      return;
+    }
 
     const countOverlay = document.getElementById('take-countdown-overlay');
     const recBtn = document.getElementById('btn-take-rec');
@@ -4303,6 +4729,10 @@ export class DubbingApp {
         countOverlay.textContent = c;
         SFX.playClick();
         await new Promise(r => setTimeout(r, 650));
+        if (cancelled()) {
+          countOverlay.style.display = 'none';
+          return;
+        }
       }
       countOverlay.textContent = '¡HABLA!';
       setTimeout(() => { countOverlay.style.display = 'none'; }, 500);
@@ -4316,6 +4746,30 @@ export class DubbingApp {
 
     // Start video playback
     await this.startTakeVideoSegment(activeDiag.timestamp || 0);
+    if (cancelled()) return;
+
+    // Start the recorder before the accompaniment, so a failure doesn't leave music playing
+    this.liveMicLevelHistory = [];
+    const recordingStarted = await this.audio.startRecording();
+    if (cancelled()) {
+      this.audio.cancelRecording();
+      return;
+    }
+    if (!recordingStarted) {
+      this.isTakeArming = false;
+      if (recBtn) recBtn.classList.remove('recording');
+      if (recBtnText) recBtnText.textContent = this.userTakeRecordings.has(activeDiag.id) ? 'GRABAR DE NUEVO' : 'GRABAR MI VOZ';
+      if (avatarStatus) avatarStatus.textContent = 'Listo para doblar';
+      if (avatarOverlay) avatarOverlay.classList.remove('speaking');
+      const v = document.getElementById('take-video');
+      if (v) v.pause();
+      this.pauseAllOgvPlayers();
+      SFX.playError();
+      this.showToast('⚠️ No se pudo iniciar la grabación del micrófono.', 'error');
+      return;
+    }
+    this.isTakeArming = false;
+    this.isTakeRecording = true;
 
     // Play accompaniment
     if (this.backingBuffer) {
@@ -4334,10 +4788,6 @@ export class DubbingApp {
         this.backingAudioEl = audioEl;
       }
     }
-
-    this.liveMicLevelHistory = [];
-    this.isTakeRecording = true;
-    await this.audio.startRecording();
 
     const startTime = performance.now();
     const videoEl = document.getElementById('take-video');
@@ -4385,12 +4835,14 @@ export class DubbingApp {
     const avatarOverlay = document.getElementById('take-avatar-overlay');
 
     if (recBtn) recBtn.classList.remove('recording');
-    if (recBtnText) recBtnText.textContent = 'GRABAR DE NUEVO';
-    if (avatarStatus) avatarStatus.textContent = '✅ Toma grabada';
     if (avatarOverlay) avatarOverlay.classList.remove('speaking');
 
     // IMPORTANT: Stop the MediaRecorder FIRST, before stopping other audio
     const take = await this.audio.stopRecording();
+    const gotAudio = !!(take && take.blob && take.blob.size > 0);
+    const hadTake = this.userTakeRecordings.has(activeDiag.id);
+    if (recBtnText) recBtnText.textContent = (gotAudio || hadTake) ? 'GRABAR DE NUEVO' : 'GRABAR MI VOZ';
+    if (avatarStatus) avatarStatus.textContent = gotAudio ? '✅ Toma grabada' : (hadTake ? '✅ Toma grabada' : 'Listo para doblar');
 
     // Now stop backing audio and video playback
     if (this.activeTakeAudioSource) {
@@ -4402,10 +4854,13 @@ export class DubbingApp {
     }
     const videoEl = document.getElementById('take-video');
     if (videoEl) videoEl.pause();
+    this.pauseAllOgvPlayers();
 
-    if (take && take.blob && take.blob.size > 0) {
+    if (gotAudio) {
       SFX.playSuccess();
       const peaks = new Float32Array(this.liveMicLevelHistory);
+      const previousTake = this.userTakeRecordings.get(activeDiag.id);
+      if (previousTake?.url) URL.revokeObjectURL(previousTake.url);
       const url = URL.createObjectURL(take.blob);
       const score = Math.floor(82 + Math.random() * 16);
 
@@ -4420,6 +4875,7 @@ export class DubbingApp {
       });
 
       this.showToast(`¡Toma de "${activeDiag.character}" grabada con éxito! (Puntuación: ${score}%)`, 'success');
+      this.room?.onTakesChanged();
       this.render();
       this.setupTakeStudio();
     } else {
@@ -4490,6 +4946,7 @@ export class DubbingApp {
 
     SFX.playClick();
     this.userTakeRecordings.delete(activeDiag.id);
+    this.room?.onTakesChanged();
     this.showToast('Toma reiniciada. Puedes volver a grabar.', 'info');
     this.render();
     this.setupTakeStudio();
@@ -4503,8 +4960,13 @@ export class DubbingApp {
       this.currentTakeIndex++;
       this.render();
       this.setupTakeStudio();
+    } else if (this.room?.studioContext()) {
+      // Group dubbing: each player only records their own character
+      const idx = dubDialogues.findIndex(d => !this.userTakeRecordings.has(d.id));
+      if (idx >= 0) this.jumpToTake(idx);
+      else this.room.submitTakes();
     } else {
-      const characters = this.selectedScene?.characters || [];
+      const characters = this.getDubbableCharacters(this.selectedScene);
       const allDialogues = this.selectedScene?.dialogues || [];
       const allCharsDone = characters.length > 0 && characters.every(c => {
         const lines = allDialogues.filter(d => d.character.toLowerCase() === c.toLowerCase());
@@ -4556,6 +5018,13 @@ export class DubbingApp {
   stopTakePlayback() {
     this.isTakePlayingRef = false;
     this.isTakePlayingUser = false;
+    // Changing take / going back mid-recording must not leave the recorder running
+    if (this.isTakeRecording || this.isTakeArming) {
+      this.isTakeRecording = false;
+      this.isTakeArming = false;
+      this.takeSessionToken = (this.takeSessionToken || 0) + 1;
+      this.audio.cancelRecording();
+    }
     if (this.takeAnimFrameId) cancelAnimationFrame(this.takeAnimFrameId);
     this.takeAnimFrameId = null;
     if (this.activeTakeAudioSource) {
@@ -4578,14 +5047,19 @@ export class DubbingApp {
     }
     const videoEl = document.getElementById('take-video');
     if (videoEl) videoEl.pause();
+    this.pauseAllOgvPlayers();
   }
 
   assembleAndShowResults() {
     this.stopTakePlayback();
     SFX.playVictory();
 
-    const dubDialogues = this.getDubDialogues();
-    const takes = Array.from(this.userTakeRecordings.values());
+    // Count against the whole scene: takes are kept for every character, while
+    // getDubDialogues() only returns the lines of the character currently selected.
+    const dubDialogues = this.selectedScene?.dialogues || [];
+    const takes = dubDialogues
+      .map(d => this.userTakeRecordings.get(d.id))
+      .filter(Boolean);
     const avgScore = takes.length > 0
       ? Math.round(takes.reduce((acc, t) => acc + (t.score || 85), 0) / takes.length)
       : 88;
@@ -4629,7 +5103,8 @@ export class DubbingApp {
           duration: d.duration,
           audioBlob: takeData.blob,  // Still valid Blob from memory
           peaks: Array.from(takeData.peaks || []),
-          score: takeData.score || 92
+          score: takeData.score || 92,
+          playerName: takeData.playerName || null
         });
       }
     }
@@ -4667,9 +5142,7 @@ export class DubbingApp {
       }
     };
 
-    await this.setupPlayDub(tempDub);
-    this.navigate('play_dub');
-    this.startPlayDubLoop();
+    await this.openPlayDub(tempDub);
   }
 
   // ==========================================
@@ -4821,8 +5294,14 @@ export class DubbingApp {
             player.style.top = '0';
             player.style.left = '0';
             player.id = 'studio-ogv-canvas';
+            // The hidden native <video> never fires these in OGV mode: use the decoder's
+            player.addEventListener('loadedmetadata', () => this.setStudioDuration(player.duration));
+            player.addEventListener('ended', () => {
+              if (this.isPlaying && videoEl._ogvPlayer === player) this.onPlaybackFinished();
+            });
             videoEl.parentNode.appendChild(player);
             videoEl._ogvPlayer = player;
+            this.registerOgvPlayer(player);
             videoEl.style.opacity = '0';
           } catch (ogvErr) {
             console.warn('[OGVPlayer Studio] Init error:', ogvErr);
@@ -4832,7 +5311,7 @@ export class DubbingApp {
           videoEl._ogvPlayer.muted = !isOriginalMode;
           try { videoEl._ogvPlayer.currentTime = this.currentTime; } catch {}
           try { await videoEl._ogvPlayer.play(); } catch {}
-          return true;
+          return this.currentView === 'studio' && videoEl.isConnected;
         }
       }
 
@@ -4845,10 +5324,18 @@ export class DubbingApp {
       videoEl.currentTime = Math.min(Math.max(0, this.currentTime), maxTime);
       videoEl.removeAttribute('poster');
       await videoEl.play();
+      // The user may have switched screen/tab while play() was pending
+      if (this.currentView !== 'studio' || !videoEl.isConnected) {
+        try { videoEl.pause(); } catch {}
+        return false;
+      }
       this.currentTime = videoEl.currentTime || this.currentTime;
       return true;
     } catch (e) {
       console.warn('Studio video notice:', e);
+      // play() interrupted by a pause / new load / leaving the screen: don't start the clock
+      if (e?.name === 'AbortError' || this.currentView !== 'studio' || !videoEl.isConnected) return false;
+      // Other errors (e.g. unsupported codec): keep the scene clock + backing audio running
       return true;
     }
   }
@@ -4979,10 +5466,12 @@ export class DubbingApp {
 
     const videoEl = document.getElementById('studio-video');
     if (videoEl) {
-      if (videoEl._ogvPlayer && typeof videoEl._ogvPlayer.pause === 'function') {
-        try { videoEl._ogvPlayer.pause(); } catch {}
+      const ogvPlayer = videoEl._ogvPlayer;
+      if (ogvPlayer && typeof ogvPlayer.pause === 'function') {
+        try { ogvPlayer.pause(); } catch {}
       }
-      this.currentTime = videoEl.currentTime || this.currentTime;
+      // In OGV mode the hidden native <video> never advances: read the decoder's clock
+      this.currentTime = (ogvPlayer ? ogvPlayer.currentTime : videoEl.currentTime) || this.currentTime;
       videoEl.pause();
     }
 
@@ -5038,7 +5527,12 @@ export class DubbingApp {
     this.playedDialogueIds.clear();
 
     const videoEl = document.getElementById('studio-video');
-    if (videoEl) videoEl.currentTime = safeTarget;
+    if (videoEl) {
+      try { videoEl.currentTime = safeTarget; } catch {}
+      if (videoEl._ogvPlayer) {
+        try { videoEl._ogvPlayer.currentTime = safeTarget; } catch {}
+      }
+    }
 
     if (this.backingAudioEl) this.backingAudioEl.currentTime = safeTarget;
 
@@ -5493,6 +5987,8 @@ export class DubbingApp {
             const mp4ArrayBuf = await transcodeRes.arrayBuffer();
             const mp4Key = ogvKey.replace(/\.ogv$/i, '.mp4');
             unzipped[mp4Key] = new Uint8Array(mp4ArrayBuf);
+            // The OGV is no longer used once the MP4 exists: keeping both doubled the scene size
+            if (mp4ArrayBuf.byteLength > 0) delete unzipped[ogvKey];
           }
         } catch (e) {}
       }
@@ -5506,11 +6002,11 @@ export class DubbingApp {
         const validation = ZipEngine.validateScene(parsed);
 
         reportHtml += `<div class="val-item" style="border-bottom: 1px solid var(--border-glass); padding-bottom: 0.5rem; margin-bottom: 0.5rem;">`;
-        reportHtml += `<div><span class="val-icon success">✓</span> Escena ${idx + 1}/${parsedScenes.length}: <strong>${parsed.meta.title}</strong></div>`;
+        reportHtml += `<div><span class="val-icon success">✓</span> Escena ${idx + 1}/${parsedScenes.length}: <strong>${esc(parsed.meta.title)}</strong></div>`;
         reportHtml += `<div style="font-size:0.8rem; color:var(--text-muted); margin-left:1.5rem;">`;
-        reportHtml += `🎬 Video: ${parsed.videoKey ? parsed.videoKey.split('/').pop() : 'No encontrado'} | `;
+        reportHtml += `🎬 Video: ${parsed.videoKey ? esc(parsed.videoKey.split('/').pop()) : 'No encontrado'} | `;
         reportHtml += `💬 Diálogos: ${parsed.dialogues.length} líneas | `;
-        reportHtml += `🎭 Personajes: ${parsed.meta.characters.join(', ')}`;
+        reportHtml += `🎭 Personajes: ${esc(parsed.meta.characters.join(', '))}`;
         reportHtml += `</div></div>`;
 
         if (validation.isValid) {
@@ -5537,6 +6033,7 @@ export class DubbingApp {
 
       if (importedCount > 0) {
         this.scenes = await GameDB.getAllScenes();
+        this.room?.syncLibrary();
         SFX.playSuccess();
 
         if (successBox && successDetails) {
@@ -5560,7 +6057,7 @@ export class DubbingApp {
       console.error('Error importando ZIP:', err);
       SFX.playError();
       if (listEl) {
-        listEl.innerHTML = `<div class="val-item"><span class="val-icon error">✗</span> Error al procesar archivo: ${err.message}</div>`;
+        listEl.innerHTML = `<div class="val-item"><span class="val-icon error">✗</span> Error al procesar archivo: ${esc(err.message)}</div>`;
       }
       this.showToast(`Error: ${err.message}`, 'error');
     }
@@ -5581,7 +6078,7 @@ export class DubbingApp {
       <div class="modal-backdrop" id="preview-modal-backdrop">
         <div class="modal-dialog" style="max-width: 700px;">
           <div class="modal-header">
-            <div class="modal-title">👁️ Vista Previa: ${scene.title}</div>
+            <div class="modal-title">👁️ Vista Previa: ${esc(scene.title)}</div>
             <button class="btn-close-modal" id="btn-close-prev">✕</button>
           </div>
 
@@ -5589,12 +6086,12 @@ export class DubbingApp {
             <div style="display:flex; gap:1.25rem; align-items:center;">
               <img src="${coverUrl}" style="width: 100px; height: 100px; border-radius:14px; object-fit:cover; border: 2px solid var(--neon-cyan);" />
               <div>
-                <h3 style="font-size: 1.3rem; font-weight:800;">${scene.title}</h3>
-                <p style="color:var(--text-muted); font-size:0.85rem;">Autores: ${(scene.authors || []).join(', ')}</p>
-                <p style="color:var(--text-dim); font-size:0.8rem; margin-top:0.3rem;">${scene.readme || 'Sin descripción'}</p>
+                <h3 style="font-size: 1.3rem; font-weight:800;">${esc(scene.title)}</h3>
+                <p style="color:var(--text-muted); font-size:0.85rem;">Autores: ${esc((scene.authors || []).join(', '))}</p>
+                <p style="color:var(--text-dim); font-size:0.8rem; margin-top:0.3rem;">${esc(scene.readme || 'Sin descripción')}</p>
                 <div style="display:flex; gap:0.4rem; margin-top:0.5rem;">
                   ${(scene.characters || []).map(c => `
-                    <span class="char-badge">👤 ${c}</span>
+                    <span class="char-badge">👤 ${esc(c)}</span>
                   `).join('')}
                 </div>
               </div>
@@ -5609,7 +6106,7 @@ export class DubbingApp {
                     <div style="display:flex; align-items:center; gap:0.5rem;">
                       <img src="${charImg}" style="width: 22px; height: 22px; border-radius: 50%; object-fit: cover;" />
                       <div>
-                        <strong style="color:var(--neon-yellow);">${d.character}:</strong> “${d.caption}”
+                        <strong style="color:var(--neon-yellow);">${esc(d.character)}:</strong> “${esc(d.caption)}”
                       </div>
                     </div>
                     <span style="color:var(--neon-cyan); font-family:monospace; margin-left:0.5rem;">${d.timestamp.toFixed(2)}s</span>
@@ -5681,7 +6178,11 @@ export class DubbingApp {
 
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
-    toast.innerHTML = `<span>${type === 'success' ? '✅' : (type === 'error' ? '❌' : 'ℹ️')}</span> <span>${message}</span>`;
+    const icon = document.createElement('span');
+    icon.textContent = type === 'success' ? '✅' : (type === 'error' ? '❌' : 'ℹ️');
+    const text = document.createElement('span');
+    text.textContent = String(message); // scene titles / names come from ZIP files: never as HTML
+    toast.append(icon, ' ', text);
     root.appendChild(toast);
 
     setTimeout(() => {

@@ -9,6 +9,56 @@ const DB_VERSION = 1;
 export class GameDB {
   static _db = null;
 
+  /**
+   * Resolve when the write transaction is committed (not just when the request
+   * succeeds): a QuotaExceededError aborts the transaction AFTER req.onsuccess.
+   */
+  static _commit(tx, req, value) {
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve(value);
+      tx.onabort = () => reject(tx.error || req.error || new Error('IndexedDB transaction aborted'));
+      tx.onerror = () => reject(tx.error || req.error);
+    });
+  }
+
+  /**
+   * Prepare a scene for IndexedDB:
+   *  - drop runtime-only fields (HTMLAudioElement players can't be stored);
+   *  - store each file as a Blob. Browsers refuse records bigger than ~133 MB, but Blobs
+   *    are kept outside the record, so scenes of any size (video + audio) can be saved.
+   */
+  static _toStorable(scene) {
+    if (!scene) return scene;
+    const out = { ...scene };
+    if (Array.isArray(scene.dialogues)) {
+      out.dialogues = scene.dialogues.map(d => {
+        if (!d || !('audioEl' in d)) return d;
+        const { audioEl, ...rest } = d;
+        return rest;
+      });
+    }
+    if (scene.rawFiles && typeof scene.rawFiles === 'object') {
+      out.rawFiles = {};
+      for (const [key, value] of Object.entries(scene.rawFiles)) {
+        if (value instanceof Blob) out.rawFiles[key] = value;
+        else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) out.rawFiles[key] = new Blob([value]);
+        else out.rawFiles[key] = value;
+      }
+    }
+    return out;
+  }
+
+  /** Inverse of _toStorable: the game works with Uint8Array files in memory */
+  static async _fromStored(scene) {
+    if (!scene || !scene.rawFiles) return scene;
+    const entries = await Promise.all(Object.entries(scene.rawFiles).map(async ([key, value]) => {
+      if (value instanceof Blob) return [key, new Uint8Array(await value.arrayBuffer())];
+      return [key, value];
+    }));
+    scene.rawFiles = Object.fromEntries(entries);
+    return scene;
+  }
+
   static async getDB() {
     if (this._db) return this._db;
 
@@ -67,9 +117,8 @@ export class GameDB {
         sceneData.importDate = new Date().toISOString();
       }
 
-      const req = store.put(sceneData);
-      req.onsuccess = () => resolve(sceneData.id);
-      req.onerror = () => reject(req.error);
+      const req = store.put(this._toStorable(sceneData));
+      this._commit(tx, req, sceneData.id).then(resolve, reject);
     });
   }
 
@@ -87,7 +136,7 @@ export class GameDB {
         // Sort newest first
         const scenes = req.result || [];
         scenes.sort((a, b) => new Date(b.importDate || 0) - new Date(a.importDate || 0));
-        resolve(scenes);
+        Promise.all(scenes.map(s => this._fromStored(s))).then(resolve, reject);
       };
       req.onerror = () => reject(req.error);
     });
@@ -103,7 +152,7 @@ export class GameDB {
       const store = tx.objectStore('scenes');
       const req = store.get(id);
 
-      req.onsuccess = () => resolve(req.result || null);
+      req.onsuccess = () => this._fromStored(req.result || null).then(resolve, reject);
       req.onerror = () => reject(req.error);
     });
   }
@@ -117,9 +166,7 @@ export class GameDB {
       const tx = db.transaction('scenes', 'readwrite');
       const store = tx.objectStore('scenes');
       const req = store.delete(id);
-
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
+      this._commit(tx, req, true).then(resolve, reject);
     });
   }
 
@@ -139,9 +186,11 @@ export class GameDB {
         recordingData.date = new Date().toISOString();
       }
 
-      const req = store.put(recordingData);
-      req.onsuccess = () => resolve(recordingData.id);
-      req.onerror = () => reject(req.error);
+      const toStore = recordingData.sceneSnapshot
+        ? { ...recordingData, sceneSnapshot: this._toStorable(recordingData.sceneSnapshot) }
+        : recordingData;
+      const req = store.put(toStore);
+      this._commit(tx, req, recordingData.id).then(resolve, reject);
     });
   }
 
@@ -158,7 +207,10 @@ export class GameDB {
       req.onsuccess = () => {
         const records = req.result || [];
         records.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
-        resolve(records);
+        Promise.all(records.map(async r => {
+          if (r.sceneSnapshot) await this._fromStored(r.sceneSnapshot);
+          return r;
+        })).then(resolve, reject);
       };
       req.onerror = () => reject(req.error);
     });
@@ -174,7 +226,11 @@ export class GameDB {
       const store = tx.objectStore('recordings');
       const req = store.get(id);
 
-      req.onsuccess = () => resolve(req.result || null);
+      req.onsuccess = async () => {
+        const r = req.result || null;
+        if (r?.sceneSnapshot) await this._fromStored(r.sceneSnapshot);
+        resolve(r);
+      };
       req.onerror = () => reject(req.error);
     });
   }
@@ -188,9 +244,7 @@ export class GameDB {
       const tx = db.transaction('recordings', 'readwrite');
       const store = tx.objectStore('recordings');
       const req = store.delete(id);
-
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
+      this._commit(tx, req, true).then(resolve, reject);
     });
   }
 
@@ -220,9 +274,7 @@ export class GameDB {
       const tx = db.transaction('settings', 'readwrite');
       const store = tx.objectStore('settings');
       const req = store.put({ key, value });
-
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
+      this._commit(tx, req, true).then(resolve, reject);
     });
   }
 }

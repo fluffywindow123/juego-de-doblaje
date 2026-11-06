@@ -1522,3 +1522,89 @@ body {
   background: var(--neon-green);
 }
 
+
+/* ==========================================================================
+   MULTIJUGADOR (sala por IP / enlace)
+   ========================================================================== */
+.mp-wrap { max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 1rem; }
+.mp-header { margin-bottom: 0.25rem; }
+.mp-tag { display: inline-block; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.06em; color: var(--neon-green); background: rgba(0, 255, 136, 0.1); border: 1px solid rgba(0, 255, 136, 0.35); padding: 0.25rem 0.7rem; border-radius: 20px; }
+.mp-title { font-size: 2rem; font-weight: 900; margin: 0.6rem 0 0.25rem; }
+.mp-subtitle { color: var(--text-muted); font-size: 0.95rem; }
+.mp-card { background: var(--bg-card); border: 1px solid var(--border-glass); border-radius: var(--radius-md); padding: 1.1rem 1.25rem; }
+.mp-card-title { font-size: 1.15rem; font-weight: 800; margin-bottom: 0.5rem; }
+.mp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+.mp-row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+.mp-space { justify-content: space-between; }
+.mp-center { justify-content: center; text-align: center; }
+.mp-label { display: block; font-size: 0.8rem; font-weight: 700; color: var(--text-muted); margin-bottom: 0.4rem; }
+.mp-input { flex: 1 1 220px; min-width: 0; background: rgba(0, 0, 0, 0.35); border: 1px solid var(--border-glass); color: var(--text-main); border-radius: var(--radius-sm); padding: 0.7rem 0.9rem; font-size: 1rem; font-family: inherit; }
+.mp-input:focus { outline: none; border-color: var(--neon-cyan); box-shadow: 0 0 0 3px rgba(0, 240, 255, 0.15); }
+.mp-mono { font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; }
+.mp-btn { white-space: nowrap; }
+.mp-btn[disabled], .mp-char[disabled] { opacity: 0.5; cursor: not-allowed; }
+.mp-big { font-size: 1.15rem; padding: 0.9rem 2.2rem; font-weight: 900; }
+.mp-help { color: var(--text-muted); font-size: 0.85rem; line-height: 1.45; margin: 0.5rem 0; }
+.mp-tips ul { margin: 0.5rem 0 0 1.1rem; color: var(--text-muted); font-size: 0.88rem; line-height: 1.6; }
+.mp-error { border-color: rgba(255, 51, 75, 0.5); color: #ffb3bd; }
+.mp-note { border-color: rgba(255, 230, 0, 0.4); color: var(--neon-yellow); }
+.mp-section { font-size: 1.2rem; font-weight: 800; margin-top: 0.5rem; }
+.mp-players { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.mp-chip { display: inline-flex; align-items: center; gap: 0.4rem; background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border-glass); border-radius: 20px; padding: 0.35rem 0.8rem; font-size: 0.85rem; font-weight: 700; }
+.mp-chip-me { border-color: var(--neon-cyan); }
+.mp-chip-off { opacity: 0.5; }
+.mp-chip-role { color: var(--neon-yellow); font-weight: 600; }
+.mp-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); }
+.mp-dot.on { background: var(--neon-green); box-shadow: 0 0 8px var(--neon-green); }
+.mp-share { border-color: rgba(0, 255, 136, 0.35); }
+.mp-ip-list { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.mp-ip { font-family: ui-monospace, Menlo, monospace; font-size: 1.1rem; font-weight: 800; color: var(--neon-green); background: rgba(0, 255, 136, 0.08); border: 1px solid rgba(0, 255, 136, 0.3); border-radius: var(--radius-sm); padding: 0.35rem 0.8rem; }
+.mp-transfer-label { font-weight: 700; margin-bottom: 0.5rem; font-size: 0.9rem; }
+.mp-bar { height: 10px; border-radius: 6px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
+.mp-bar-thin { height: 6px; }
+.mp-bar-fill { height: 100%; background: linear-gradient(90deg, var(--neon-cyan), var(--neon-green)); transition: width 0.2s linear; }
+.mp-scene-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; }
+.mp-scene { background: var(--bg-card); border: 1px solid var(--border-glass); border-radius: var(--radius-md); overflow: hidden; display: flex; flex-direction: column; }
+.mp-scene-img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: #000; }
+.mp-scene-ph { display: flex; align-items: center; justify-content: center; font-size: 2rem; background: rgba(255, 255, 255, 0.04); }
+.mp-scene-body { padding: 0.8rem; display: flex; flex-direction: column; gap: 0.35rem; flex: 1; }
+.mp-scene-title { font-weight: 800; }
+.mp-scene-meta { font-size: 0.78rem; color: var(--text-muted); }
+.mp-scene-body .mp-btn { margin-top: auto; }
+.mp-char-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 0.9rem; }
+.mp-char { background: var(--bg-card); border: 2px solid var(--border-glass); border-radius: var(--radius-md); padding: 1rem 0.75rem; color: var(--text-main); font-family: inherit; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 0.3rem; transition: transform 0.15s ease, border-color 0.15s ease; }
+.mp-char:not([disabled]):hover { transform: translateY(-2px); border-color: var(--neon-cyan); }
+.mp-char-mine { border-color: var(--neon-green); background: rgba(0, 255, 136, 0.1); box-shadow: 0 0 18px rgba(0, 255, 136, 0.25); }
+.mp-char-taken { border-color: rgba(255, 0, 127, 0.5); }
+.mp-char-img { width: 76px; height: 76px; border-radius: 50%; object-fit: cover; }
+.mp-char-name { font-weight: 800; font-size: 1.05rem; }
+.mp-char-meta { font-size: 0.75rem; color: var(--text-muted); }
+.mp-char-who { font-size: 0.85rem; font-weight: 700; color: var(--neon-yellow); }
+.mp-rec-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.95rem; }
+.mp-rec-head .mp-mono { margin-left: auto; }
+.mp-rec-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--neon-red); box-shadow: 0 0 10px var(--neon-red); animation: mp-blink 1.2s infinite; }
+@keyframes mp-blink { 50% { opacity: 0.25; } }
+.mp-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border-glass); }
+.mp-video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.mp-countdown { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: clamp(3rem, 12vw, 7rem); font-weight: 900; color: #fff; text-shadow: 0 0 30px rgba(0, 240, 255, 0.8); background: rgba(0, 0, 0, 0.45); }
+.mp-tele { background: var(--bg-card); border: 2px solid var(--border-glass); border-radius: var(--radius-md); padding: 1rem 1.25rem; text-align: center; min-height: 120px; transition: border-color 0.2s ease, background 0.2s ease; }
+.mp-tele-mine { border-color: var(--neon-pink); background: rgba(255, 0, 127, 0.12); box-shadow: var(--shadow-neon-pink); }
+.mp-tele-speaker { font-weight: 800; color: var(--neon-cyan); font-size: 0.95rem; }
+.mp-tele-mine .mp-tele-speaker { color: var(--neon-pink); }
+.mp-tele-text { font-size: clamp(1.15rem, 3vw, 1.6rem); font-weight: 800; margin: 0.4rem 0; }
+.mp-tele-next { font-size: 0.85rem; color: var(--text-muted); }
+.mp-spinner { width: 42px; height: 42px; margin: 0.5rem auto 1rem; border-radius: 50%; border: 4px solid rgba(255, 255, 255, 0.1); border-top-color: var(--neon-green); animation: mp-spin 0.9s linear infinite; }
+@keyframes mp-spin { to { transform: rotate(360deg); } }
+@media (max-width: 600px) {
+  .mp-title { font-size: 1.5rem; }
+  .mp-big { width: 100%; }
+}
+.mp-online { border-color: rgba(0, 240, 255, 0.45); box-shadow: 0 0 22px rgba(0, 240, 255, 0.12); }
+.mp-code { font-size: 1.25rem; letter-spacing: 0.02em; color: var(--neon-cyan); border-color: rgba(0, 240, 255, 0.4); background: rgba(0, 240, 255, 0.08); user-select: all; }
+.mp-error-text { color: #ffb3bd; }
+.mp-studio-strip { background: rgba(0, 255, 136, 0.06); border: 1px solid rgba(0, 255, 136, 0.35); border-radius: var(--radius-md); padding: 0.85rem 1rem; margin: 0.75rem 0 1rem; display: flex; flex-direction: column; gap: 0.6rem; }
+.mp-prog-list { display: flex; flex-direction: column; gap: 0.55rem; }
+.mp-prog-head { display: flex; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; font-size: 0.88rem; margin-bottom: 0.25rem; }
+.mp-prog-done { color: var(--neon-green); font-weight: 800; }
+.mp-toggle { display: inline-flex; align-items: center; gap: 0.55rem; cursor: pointer; font-size: 0.95rem; }
+.mp-toggle input { width: 20px; height: 20px; accent-color: var(--neon-green); cursor: pointer; }

@@ -522,7 +522,7 @@ class VoiceDubGame(tk.Tk):
         scale_voc.pack(side="left")
 
         # Initial Avatar Setup
-        first_char = scene.get("dialogues", [{}])[0].get("character", "Woody")
+        first_char = (scene.get("dialogues") or [{}])[0].get("character", "Woody")
         self.update_stage_character(first_char, is_speaking=False)
 
     def update_stage_character(self, char_name, is_speaking=False):
@@ -537,10 +537,26 @@ class VoiceDubGame(tk.Tk):
         status = "¡HABLANDO AHORA!" if is_speaking else "En espera"
         self.lbl_speaker_name.configure(text=f"👤 {char_name.upper()} • {status}", fg=color)
 
+    def _idle_play_label(self):
+        if self.current_mode == "dubbing":
+            return "🎙️ INICIAR GRABACIÓN DE DOBLAJE"
+        if self.current_mode == "dubbed_preview":
+            return "▶️ REPRODUCIR TU DOBLAJE"
+        return "▶️ INICIAR REPRODUCCIÓN"
+
+    def _reset_play_controls(self):
+        """Restore the play/pause buttons of the player screen (if it is still shown)."""
+        btn = getattr(self, "btn_play_toggle", None)
+        if btn is not None and btn.winfo_exists():
+            btn.configure(text=self._idle_play_label())
+        btn_pause = getattr(self, "btn_pause", None)
+        if btn_pause is not None and btn_pause.winfo_exists():
+            btn_pause.configure(text="⏸️ Pausar")
+
     def toggle_play_original(self):
         if self.audio.is_playing:
             self.audio.stop()
-            self.btn_play_toggle.configure(text="▶️ INICIAR REPRODUCCIÓN")
+            self._reset_play_controls()
         else:
             self.audio.play_scene(
                 mode="original",
@@ -552,20 +568,21 @@ class VoiceDubGame(tk.Tk):
     def toggle_play_dubbing(self):
         if self.audio.is_playing:
             self.audio.stop()
-            self.btn_play_toggle.configure(text="🎙️ INICIAR GRABACIÓN DE DOBLAJE")
+            self._reset_play_controls()
         else:
             self.audio.play_scene(
                 mode="dubbing",
                 dubbed_character=self.selected_role,
                 on_update_callback=self.on_audio_time_update,
-                on_finish_callback=self.show_results_view
+                # Called from the audio thread: build the results screen on the Tk main thread
+                on_finish_callback=lambda: self.after(0, self.show_results_view)
             )
             self.btn_play_toggle.configure(text="⏹️ PARAR GRABACIÓN")
 
     def toggle_play_preview(self):
         if self.audio.is_playing:
             self.audio.stop()
-            self.btn_play_toggle.configure(text="▶️ REPRODUCIR TU DOBLAJE")
+            self._reset_play_controls()
         else:
             self.audio.play_scene(
                 mode="dubbed_preview",
@@ -586,8 +603,7 @@ class VoiceDubGame(tk.Tk):
 
     def stop_playback(self):
         self.audio.stop()
-        if hasattr(self, 'btn_play_toggle'):
-            self.btn_play_toggle.configure(text="▶️ INICIAR REPRODUCCIÓN")
+        self._reset_play_controls()
 
     def on_audio_time_update(self, current_sec):
         # Update UI thread-safely
@@ -595,6 +611,10 @@ class VoiceDubGame(tk.Tk):
 
     def _update_timeline_ui(self, current_sec):
         if not self.selected_scene:
+            return
+        # The update may arrive after the player screen was destroyed (e.g. "Salir al Menú")
+        progress = getattr(self, "progress_bar", None)
+        if progress is None or not progress.winfo_exists():
             return
 
         total_sec = max(self.selected_scene.get("duration", 60), 1.0)
@@ -624,7 +644,7 @@ class VoiceDubGame(tk.Tk):
 
         if active_diag:
             char = active_diag.get("character", "Personaje")
-            caption = active_diag.get("caption", "")
+            caption = active_diag.get("caption", "").strip('"“”‘’\'')
 
             is_user_turn = (self.current_mode == "dubbing") and (
                 self.selected_role.lower() == char.lower() or self.selected_role == "All"
@@ -658,7 +678,13 @@ class VoiceDubGame(tk.Tk):
             self.lbl_countdown.configure(text="", fg=TEXT_DIM)
 
     def on_playback_finished(self):
-        self.after(0, lambda: self.lbl_status_track.configure(text="Reproducción finalizada."))
+        self.after(0, self._on_playback_finished_ui)
+
+    def _on_playback_finished_ui(self):
+        self._reset_play_controls()
+        lbl = getattr(self, "lbl_status_track", None)
+        if lbl is not None and lbl.winfo_exists():
+            lbl.configure(text="Reproducción finalizada.")
 
     # =========================================================
     # VIEW: RESULTADOS Y PUNTUACION

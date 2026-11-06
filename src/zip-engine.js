@@ -49,8 +49,13 @@ export class ZipEngine {
       const nameBuf = buffer.subarray(p + 46, p + 46 + nameLen);
       const fileName = decoder.decode(nameBuf);
 
+      // Skip the hidden metadata macOS adds when compressing with Finder
+      // (__MACOSX/ folder, AppleDouble "._x" files, .DS_Store): they are not scene files
+      const baseName = fileName.substring(fileName.lastIndexOf('/') + 1);
+      const isMacJunk = /(^|\/)__MACOSX\//.test(fileName) || baseName.startsWith('._') || baseName === '.DS_Store';
+
       // Read local header to calculate exact data offset
-      if (localHeaderOffset + 30 <= buffer.byteLength) {
+      if (!isMacJunk && localHeaderOffset + 30 <= buffer.byteLength) {
         const localNameLen = view.getUint16(localHeaderOffset + 26, true);
         const localExtraLen = view.getUint16(localHeaderOffset + 28, true);
         const dataOffset = localHeaderOffset + 30 + localNameLen + localExtraLen;
@@ -63,35 +68,21 @@ export class ZipEngine {
           decompressed = new Uint8Array(rawData);
         } else if (method === 8) { // Deflate
           try {
-            const ds = new DecompressionStream('deflate-raw');
-            const writer = ds.writable.getWriter();
-            writer.write(rawData);
-            writer.close();
-            const reader = ds.readable.getReader();
-            const chunks = [];
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              chunks.push(value);
-            }
-            const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
-            const merged = new Uint8Array(totalLength);
-            let offset = 0;
-            for (const chunk of chunks) {
-              merged.set(chunk, offset);
-              offset += chunk.length;
-            }
-            decompressed = merged;
+            // Piping through a Response surfaces every stream error as a rejection here
+            // (unawaited writer.write()/close() promises used to crash Node on bad data)
+            const stream = new Blob([rawData]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+            decompressed = new Uint8Array(await new Response(stream).arrayBuffer());
           } catch (err) {
+            // Corrupt entry: skip it rather than storing the compressed bytes as content
             console.error(`Error descomprimiendo ${fileName}:`, err);
-            decompressed = rawData;
+            decompressed = null;
           }
         } else {
           console.warn(`Método de compresión desconocido (${method}) para ${fileName}`);
-          decompressed = rawData;
+          decompressed = null;
         }
 
-        files[fileName] = decompressed;
+        if (decompressed) files[fileName] = decompressed;
       }
 
       p += 46 + nameLen + extraLen + commentLen;
@@ -229,9 +220,15 @@ export class ZipEngine {
     }
 
     // 3. Locate backing track
-    let backingTrackKey = fileKeys.find(k => k.startsWith(prefix) && (k.includes('backing_track') || k.includes('background') || k.includes('music') || k.includes('bgm') || k.includes('instrumental')));
+    // Only audio files qualify (a "background.png" used to be picked as the music)
+    const isAudioFile = (k) => /\.(mp3|ogg|wav|m4a)$/i.test(k);
+    const looksLikeBacking = (k) => {
+      const name = k.substring(k.lastIndexOf('/') + 1).toLowerCase();
+      return name.includes('backing_track') || name.includes('background') || name.includes('music') || name.includes('bgm') || name.includes('instrumental');
+    };
+    let backingTrackKey = fileKeys.find(k => k.startsWith(prefix) && isAudioFile(k) && looksLikeBacking(k));
     if (!backingTrackKey) {
-      backingTrackKey = fileKeys.find(k => k.includes('backing_track') || k.includes('background') || k.includes('music') || k.includes('_backing_track'));
+      backingTrackKey = fileKeys.find(k => isAudioFile(k) && looksLikeBacking(k));
     }
 
     // 4. Locate dialogue files (.txt or .ini files excluding pack_info)
@@ -293,12 +290,11 @@ export class ZipEngine {
       if (charName) charactersSet.add(charName);
 
       // Locate matching audio (.mp3, .ogg, .wav)
+      const baseLower = baseName.toLowerCase();
       let matchingAudioKey = fileKeys.find(k => {
         const lower = k.toLowerCase();
-        return (lower.endsWith(`/${baseName.toLowerCase()}.mp3`) || 
-                lower.endsWith(`/${baseName.toLowerCase()}.ogg`) || 
-                lower.endsWith(`/${baseName.toLowerCase()}.wav`) ||
-                lower === `${prefix.toLowerCase()}${baseName.toLowerCase()}.mp3`);
+        const fileLower = lower.substring(lower.lastIndexOf('/') + 1);
+        return fileLower === `${baseLower}.mp3` || fileLower === `${baseLower}.ogg` || fileLower === `${baseLower}.wav`;
       });
 
       // Fuzzy matching if filename had timestamp suffix
@@ -307,7 +303,8 @@ export class ZipEngine {
         if (numberPrefix) {
           matchingAudioKey = fileKeys.find(k => {
             const fileName = k.substring(k.lastIndexOf('/') + 1);
-            return fileName.startsWith(numberPrefix) && (fileName.endsWith('.mp3') || fileName.endsWith('.ogg') || fileName.endsWith('.wav'));
+            // Same number, not just same leading digits ("1_buzz" must not match "10_woody.mp3")
+            return fileName.match(/^(\d+)/)?.[1] === numberPrefix && /\.(mp3|ogg|wav)$/i.test(fileName);
           });
         }
       }
@@ -498,6 +495,10 @@ export class ZipEngine {
 
     const encoder = new TextEncoder();
 
+    const now = new Date();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | Math.floor(now.getSeconds() / 2);
+    const dosDate = ((Math.max(1980, now.getFullYear()) - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+
     for (const [name, data] of fileEntries) {
       const nameBytes = encoder.encode(name);
       const dataBytes = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -510,10 +511,10 @@ export class ZipEngine {
       const lhView = new DataView(localHeader.buffer);
       lhView.setUint32(0, 0x04034b50, true); // Local file header signature
       lhView.setUint16(4, 20, true); // Version needed
-      lhView.setUint16(6, 0, true); // General purpose bit flag
+      lhView.setUint16(6, 0x0800, true); // General purpose bit flag: names are UTF-8
       lhView.setUint16(8, 0, true); // Compression method (0 = stored)
-      lhView.setUint16(10, 0, true); // Last mod time
-      lhView.setUint16(12, 0, true); // Last mod date
+      lhView.setUint16(10, dosTime, true); // Last mod time
+      lhView.setUint16(12, dosDate, true); // Last mod date
       lhView.setUint32(14, crc, true); // CRC-32
       lhView.setUint32(18, size, true); // Compressed size
       lhView.setUint32(22, size, true); // Uncompressed size
@@ -530,10 +531,10 @@ export class ZipEngine {
       cdView.setUint32(0, 0x02014b50, true); // Central directory file header signature
       cdView.setUint16(4, 20, true); // Version made by
       cdView.setUint16(6, 20, true); // Version needed
-      cdView.setUint16(8, 0, true); // General purpose bit flag
+      cdView.setUint16(8, 0x0800, true); // General purpose bit flag: names are UTF-8
       cdView.setUint16(10, 0, true); // Compression method
-      cdView.setUint16(12, 0, true); // Last mod time
-      cdView.setUint16(14, 0, true); // Last mod date
+      cdView.setUint16(12, dosTime, true); // Last mod time
+      cdView.setUint16(14, dosDate, true); // Last mod date
       cdView.setUint32(16, crc, true); // CRC-32
       cdView.setUint32(20, size, true); // Compressed size
       cdView.setUint32(24, size, true); // Uncompressed size
@@ -573,14 +574,20 @@ export class ZipEngine {
    * Standard CRC32 table calculation
    */
   static crc32(buffer) {
+    // Table-driven: ~8x faster than bit by bit (scenes are tens of MB when shared in a room)
+    if (!ZipEngine._crcTable) {
+      const table = new Uint32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        table[n] = c >>> 0;
+      }
+      ZipEngine._crcTable = table;
+    }
+    const table = ZipEngine._crcTable;
     let crc = -1;
     for (let i = 0; i < buffer.length; i++) {
-      const byte = buffer[i];
-      let code = (crc ^ byte) & 0xff;
-      for (let j = 0; j < 8; j++) {
-        code = (code & 1) ? (0xedb88320 ^ (code >>> 1)) : (code >>> 1);
-      }
-      crc = (crc >>> 8) ^ code;
+      crc = (crc >>> 8) ^ table[(crc ^ buffer[i]) & 0xff];
     }
     return (crc ^ -1) >>> 0;
   }

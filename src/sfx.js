@@ -171,6 +171,42 @@ export class SFX {
   }
 
   /**
+   * Victory fanfare played when a whole scene has been dubbed
+   */
+  static playVictory() {
+    this.init();
+    if (!this.ctx) return;
+    const now = this.ctx.currentTime;
+    // C5 E5 G5 C6 (arpeggio) followed by a held G5+C6 chord
+    const notes = [
+      { freq: 523.25, start: 0.0, len: 0.18 },
+      { freq: 659.25, start: 0.12, len: 0.18 },
+      { freq: 783.99, start: 0.24, len: 0.18 },
+      { freq: 1046.50, start: 0.36, len: 0.5 },
+      { freq: 783.99, start: 0.52, len: 0.7 },
+      { freq: 1046.50, start: 0.52, len: 0.7 }
+    ];
+
+    notes.forEach(({ freq, start, len }) => {
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      const t = now + start;
+
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, t);
+
+      gain.gain.setValueAtTime(0.22, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + len);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      osc.start(t);
+      osc.stop(t + len + 0.05);
+    });
+  }
+
+  /**
    * Error or delete sound
    */
   static playError() {

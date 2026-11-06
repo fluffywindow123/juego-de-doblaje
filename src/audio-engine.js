@@ -100,6 +100,9 @@ export class AudioEngine {
         });
 
         if (this.ctx) {
+          if (this.micSource) {
+            try { this.micSource.disconnect(); } catch {}
+          }
           this.micSource = this.ctx.createMediaStreamSource(this.micStream);
           this.micSource.connect(this.analyser);
         }
@@ -108,6 +111,34 @@ export class AudioEngine {
       }
     }
     return this.micStream;
+  }
+
+  /**
+   * Stop the microphone tracks (turns off the browser's recording indicator)
+   */
+  releaseMicrophone() {
+    this.cancelRecording();
+    if (this.micSource) {
+      try { this.micSource.disconnect(); } catch {}
+      this.micSource = null;
+    }
+    if (this.micStream) {
+      try { this.micStream.getTracks().forEach(t => t.stop()); } catch {}
+      this.micStream = null;
+    }
+  }
+
+  /**
+   * Abort an in-progress recording and discard its audio
+   */
+  cancelRecording() {
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      this.mediaRecorder.ondataavailable = null;
+      this.mediaRecorder.onstop = null;
+      try { this.mediaRecorder.stop(); } catch {}
+    }
+    this.isRecording = false;
+    this.recordedChunks = [];
   }
 
   toUint8(raw) {
@@ -142,7 +173,7 @@ export class AudioEngine {
     return new Promise((resolve) => {
       // Decode with both Promise and Callback fallbacks for all browsers
       try {
-        this.ctx.decodeAudioData(
+        const maybePromise = this.ctx.decodeAudioData(
           arrayBuffer,
           (decodedBuffer) => {
             if (cacheKey) {
@@ -155,6 +186,8 @@ export class AudioEngine {
             resolve(null);
           }
         );
+        // Modern browsers also reject the returned promise: avoid "Uncaught (in promise)"
+        if (maybePromise && typeof maybePromise.catch === 'function') maybePromise.catch(() => {});
       } catch (err) {
         console.warn('Exception during audio decode:', err);
         resolve(null);
@@ -165,7 +198,7 @@ export class AudioEngine {
   /**
    * Play an AudioBuffer with specified track type ('backing', 'voice', 'original')
    */
-  playBuffer(audioBuffer, trackType = 'backing', offset = 0, onEnded = null) {
+  playBuffer(audioBuffer, trackType = 'backing', offset = 0, onEnded = null, effectName = null) {
     if (!audioBuffer) return null;
 
     // If Web Audio is active
@@ -183,8 +216,10 @@ export class AudioEngine {
         else if (trackType === 'voice') targetGain = this.voiceGain;
         else if (trackType === 'original') targetGain = this.originalVoiceGain;
 
-        if (trackType === 'voice' && this.selectedEffect !== 'clean') {
-          const fxChain = this.createEffectChain(this.selectedEffect);
+        const effect = effectName || this.selectedEffect || 'clean';
+        let fxChain = null;
+        if (trackType === 'voice' && effect !== 'clean') {
+          fxChain = this.createEffectChain(effect);
           source.connect(fxChain.input);
           fxChain.output.connect(targetGain);
         } else {
@@ -192,9 +227,10 @@ export class AudioEngine {
         }
 
         source.onended = () => {
+          if (fxChain) fxChain.dispose();
           const idx = this.activeAudioSources.indexOf(source);
           if (idx !== -1) this.activeAudioSources.splice(idx, 1);
-          if (onEnded) onEnded();
+          if (typeof onEnded === 'function') onEnded();
         };
 
         const safeOffset = Math.max(0, Math.min(offset, audioBuffer.duration - 0.05));
@@ -238,10 +274,13 @@ export class AudioEngine {
    * Start recording user voice
    */
   async startRecording() {
+    // Always start from an empty take: stale chunks from a previous recording must
+    // never be returned by stopRecording() as if they were this one.
+    this.recordedChunks = [];
     await this.requestMicrophone();
     if (!this.micStream) {
       console.warn('Cannot record: mic stream is not available');
-      return;
+      return false;
     }
 
     // Ensure audio tracks are live
@@ -279,8 +318,10 @@ export class AudioEngine {
 
       this.mediaRecorder.start(40);
       this.isRecording = true;
+      return true;
     } catch (err) {
       console.warn('MediaRecorder start error:', err);
+      return false;
     }
   }
 
@@ -290,7 +331,8 @@ export class AudioEngine {
   async stopRecording() {
     if (!this.mediaRecorder || this.mediaRecorder.state === 'inactive') {
       if (this.recordedChunks && this.recordedChunks.length > 0) {
-        const blob = new Blob(this.recordedChunks, { type: 'audio/webm' });
+        const blob = new Blob(this.recordedChunks, { type: this.mediaRecorder?.mimeType || 'audio/webm' });
+        this.recordedChunks = [];
         return { blob, audioBuf: null, duration: (performance.now() - this.recordingStartTime) / 1000 };
       }
       return null;
@@ -333,13 +375,14 @@ export class AudioEngine {
         const source = this.ctx.createBufferSource();
         source.buffer = audioBuffer;
 
-        const { input, output } = this.createEffectChain(effectName || this.selectedEffect || 'clean');
-        source.connect(input);
-        output.connect(this.voiceGain || this.masterGain || this.ctx.destination);
+        const fxChain = this.createEffectChain(effectName || this.selectedEffect || 'clean');
+        source.connect(fxChain.input);
+        fxChain.output.connect(this.voiceGain || this.masterGain || this.ctx.destination);
 
         source.start(0);
         this.activeAudioSources.push(source);
         source.onended = () => {
+          fxChain.dispose();
           const idx = this.activeAudioSources.indexOf(source);
           if (idx !== -1) this.activeAudioSources.splice(idx, 1);
         };
@@ -457,6 +500,7 @@ export class AudioEngine {
   createEffectChain(effectName) {
     const input = this.ctx.createGain();
     const output = this.ctx.createGain();
+    let robotOsc = null;
 
     if (effectName === 'cartoon') {
       const highpass = this.ctx.createBiquadFilter();
@@ -488,6 +532,7 @@ export class AudioEngine {
       input.connect(oscGain);
       oscGain.connect(output);
       osc.start();
+      robotOsc = osc;
     } else if (effectName === 'megaphone') {
       const bandpass = this.ctx.createBiquadFilter();
       bandpass.type = 'bandpass';
@@ -512,6 +557,18 @@ export class AudioEngine {
       input.connect(output);
     }
 
-    return { input, output };
+    // Call when the source using this chain ends: stops the robot oscillator (which
+    // would otherwise run forever) and detaches the chain from the mixer.
+    const dispose = () => {
+      if (robotOsc) {
+        try { robotOsc.stop(); } catch {}
+        try { robotOsc.disconnect(); } catch {}
+        robotOsc = null;
+      }
+      // Let a reverb/echo tail ring out before detaching the chain
+      setTimeout(() => { try { output.disconnect(); } catch {} }, 2000);
+    };
+
+    return { input, output, dispose };
   }
 }
