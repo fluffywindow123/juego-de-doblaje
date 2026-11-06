@@ -130,7 +130,10 @@ export class DubbingApp {
     const storedStarter = this.scenes.find(s => s.id === starterId);
     // Players who opened a room link (from another device / the internet) get their
     // scenes from the room: don't make them wait for the 40 MB starter download first.
-    const isRoomGuestPage = !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname);
+    // (room pages are served by the host's room ports or the free trycloudflare tunnel;
+    //  other sites such as GitHub Pages still get the starter scene)
+    const isRoomGuestPage = window.location.hostname.endsWith('.trycloudflare.com') ||
+      ['3001', '3443'].includes(window.location.port);
     const needsUpgrade = !isRoomGuestPage && (this.scenes.length === 0 || (!!storedStarter && (
       !storedStarter.rawFiles ||
       !Object.keys(storedStarter.rawFiles).some(k => k.toLowerCase().endsWith('.mp4'))

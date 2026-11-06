@@ -1295,7 +1295,12 @@ export class MultiplayerController {
               <p class="mp-help">Tu ordenador será el anfitrión. Te daremos un <b>enlace</b>, un <b>código</b> para jugar por internet y tu <b>IP</b> para la misma red.</p>
               <button id="mp-create" class="btn-cyan mp-btn" ${this.connecting ? 'disabled' : ''}>${this.connecting ? '⏳ Creando…' : '🏠 Crear sala'}</button>
             </div>
-          ` : ''}
+          ` : `
+            <div class="mp-card">
+              <h3 class="mp-card-title">🏠 Crear sala</h3>
+              <p class="mp-help">Para crear una sala, el anfitrión necesita el juego en su ordenador (descárgalo de GitHub y ejecuta <code>npm start</code>). Desde aquí puedes unirte a la sala de un amigo con su <b>código</b>.</p>
+            </div>
+          `}
           <div class="mp-card">
             <h3 class="mp-card-title">🔌 Unirse con código o IP</h3>
             <p class="mp-help">Por internet: escribe el <b>código</b> que ve el anfitrión (ej: brave-apple-salmon-kit). En la misma red también vale su <b>IP</b> (ej: 192.168.1.25).</p>
@@ -1644,6 +1649,11 @@ export class MultiplayerController {
         const base = this.baseFromInput(ipInput.value);
         if (!base) {
           this.toast('Escribe el código de la sala (ej: brave-apple-salmon-kit) o una IP (ej: 192.168.1.25)', 'error');
+          return;
+        }
+        // A secure page (e.g. GitHub Pages) can't talk to an http:// address
+        if (window.location.protocol === 'https:' && base.startsWith('http://')) {
+          this.toast('Desde la web (https) no se puede entrar por IP: usa el código o el enlace de la sala online.', 'error');
           return;
         }
         lsSet(LAST_IP_KEY, ipInput.value.trim());
